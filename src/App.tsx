@@ -4,6 +4,14 @@ import "./components/Avatar/avatar.css";
 import { Avatar } from "./components/Avatar";
 import type { AvatarControls } from "./components/Avatar";
 import { isSarvamConfigured, llmReplyMock, llmReplySarvam, sttSarvam, ttsSarvam } from "./services/sarvamClient";
+import {
+  getSahaaraHealth,
+  getWatchLatest,
+  getWatchUserId,
+  placeDoctorAppointment,
+  placeGroceryOrder,
+  placePharmacyOrder,
+} from "./services/sahaaraApiClient";
 
 type ChatRole = "user" | "assistant";
 type InputMode = "voice" | "chat";
@@ -16,9 +24,17 @@ interface ChatMessage {
   mode: InputMode;
 }
 
+interface WatchPanelSnapshot {
+  heartRate?: number;
+  spo2?: number;
+  skinTemp?: number;
+  freefallStatus?: string;
+}
+
 const STORAGE_KEY = "sahaara.ai.chatHistory.v2";
 const MAX_MESSAGES = 180;
 const TRANSCRIPT_WORDS_PREVIEW = 22;
+const DEFAULT_ADDRESS = "Saved user address";
 
 function App() {
   const avatarControlsRef = useRef<AvatarControls | null>(null);
@@ -41,6 +57,10 @@ function App() {
   const [liveUserTranscript, setLiveUserTranscript] = useState("");
   const [liveAiTranscript, setLiveAiTranscript] = useState("");
   const [status, setStatus] = useState("Ready");
+  const [showHealthPanel, setShowHealthPanel] = useState(false);
+  const [healthLoading, setHealthLoading] = useState(false);
+  const [healthError, setHealthError] = useState("");
+  const [watchSnapshot, setWatchSnapshot] = useState<WatchPanelSnapshot | null>(null);
 
   const supportsRecording =
     typeof window !== "undefined" &&
@@ -59,6 +79,25 @@ function App() {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(messages.slice(-MAX_MESSAGES)));
     } catch {}
   }, [messages]);
+
+  const loadWatchSnapshot = useCallback(async () => {
+    setHealthLoading(true);
+    setHealthError("");
+    try {
+      const userId = getWatchUserId();
+      const latest = await getWatchLatest(userId);
+      setWatchSnapshot({
+        heartRate: latest.snapshot.heartRate,
+        spo2: latest.snapshot.spo2,
+        skinTemp: latest.snapshot.skinTemp,
+        freefallStatus: latest.snapshot.freefallStatus,
+      });
+    } catch (error) {
+      setHealthError(toErrorMessage(error));
+    } finally {
+      setHealthLoading(false);
+    }
+  }, []);
 
   const stopAiTranscriptAnimation = useCallback(() => {
     if (aiTranscriptTimerRef.current !== null) {
@@ -159,15 +198,26 @@ function App() {
 
       let reply = "";
 
-      if (isSarvamConfigured()) {
-        try {
-          reply = await llmReplySarvam(normalized, snapshot);
-        } catch (error) {
-          setStatus(`LLM fallback: ${toErrorMessage(error)}`);
+      try {
+        const actionReply = await tryHandleSahaaraAction(normalized);
+        if (actionReply) {
+          reply = actionReply;
+        }
+      } catch (error) {
+        setStatus(`API action failed: ${toErrorMessage(error)}`);
+      }
+
+      if (!reply) {
+        if (isSarvamConfigured()) {
+          try {
+            reply = await llmReplySarvam(normalized, snapshot);
+          } catch (error) {
+            setStatus(`LLM fallback: ${toErrorMessage(error)}`);
+            reply = await llmReplyMock(normalized, snapshot);
+          }
+        } else {
           reply = await llmReplyMock(normalized, snapshot);
         }
-      } else {
-        reply = await llmReplyMock(normalized, snapshot);
       }
 
       appendMessage({
@@ -401,6 +451,15 @@ function App() {
     };
   }, [stopAiTranscriptAnimation, stopAiVoice, stopRecording, stopSpeechRecognition]);
 
+  useEffect(() => {
+    if (!showHealthPanel) return;
+    void loadWatchSnapshot();
+    const timer = window.setInterval(() => {
+      void loadWatchSnapshot();
+    }, 8000);
+    return () => window.clearInterval(timer);
+  }, [loadWatchSnapshot, showHealthPanel]);
+
   const handleSend = useCallback(
     async (event: React.FormEvent) => {
       event.preventDefault();
@@ -480,6 +539,16 @@ function App() {
               </svg>
             </button>
             <button
+              className={`icon-btn ${showHealthPanel ? "success" : "secondary"}`}
+              onClick={() => setShowHealthPanel((prev) => !prev)}
+              title={showHealthPanel ? "Hide health" : "Show health"}
+              aria-label={showHealthPanel ? "Hide health" : "Show health"}
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 21s-6.66-4.35-9.33-8.02C.78 10.37 1.38 6.9 4.4 5.2c2.2-1.23 4.5-.51 5.94 1.1C11.78 4.69 14.08 3.97 16.28 5.2c3.02 1.7 3.62 5.17 1.73 7.78C18.66 16.65 12 21 12 21z" />
+              </svg>
+            </button>
+            <button
               className={`icon-btn ${isChatOnly ? "success" : "secondary"}`}
               onClick={toggleChatOnly}
               title={isChatOnly ? "Voice mode" : "Chat mode"}
@@ -528,6 +597,47 @@ function App() {
         {status}
       </p>
 
+      {showHealthPanel && (
+        <section className="floating-health" aria-label="Watch health panel">
+          <div className="health-grid">
+            <article className="health-card">
+              <div className="health-icon heart">❤</div>
+              <div className="health-meta">
+                <span>Heart Rate</span>
+                <strong>{watchSnapshot?.heartRate != null ? `${watchSnapshot.heartRate} bpm` : "--"}</strong>
+              </div>
+            </article>
+
+            <article className="health-card">
+              <div className="health-icon spo2">O2</div>
+              <div className="health-meta">
+                <span>SpO2</span>
+                <strong>{watchSnapshot?.spo2 != null ? `${watchSnapshot.spo2}%` : "--"}</strong>
+              </div>
+            </article>
+
+            <article className="health-card">
+              <div className="health-icon temp">🌡</div>
+              <div className="health-meta">
+                <span>Skin Temp</span>
+                <strong>{watchSnapshot?.skinTemp != null ? `${watchSnapshot.skinTemp} C` : "--"}</strong>
+              </div>
+            </article>
+
+            <article className={`health-card status ${freefallClass(watchSnapshot?.freefallStatus)}`}>
+              <div className="health-icon fall">⚠</div>
+              <div className="health-meta">
+                <span>Freefall</span>
+                <strong>{formatFreefall(watchSnapshot?.freefallStatus)}</strong>
+              </div>
+            </article>
+          </div>
+
+          {healthLoading && <p className="health-state">Loading...</p>}
+          {healthError && <p className="health-state error">{healthError}</p>}
+        </section>
+      )}
+
       {!isChatOnly && (
         <section className="floating-conversation" aria-label="Live conversation">
           <div className="floating-conversation-stream">
@@ -544,6 +654,102 @@ function App() {
       )}
     </div>
   );
+}
+
+async function tryHandleSahaaraAction(text: string): Promise<string | null> {
+  const lower = text.toLowerCase();
+  const userId = getWatchUserId();
+
+  if (/(api health|health status|backend status|server status)/i.test(lower)) {
+    const health = await getSahaaraHealth();
+    return health.firebase.initialized
+      ? "Sahaara API is connected and Firebase is initialized."
+      : "Sahaara API is reachable but Firebase is not initialized yet.";
+  }
+
+  if (/(watch|heart rate|spo2|oxygen|skin temp|temperature|vitals)/i.test(lower)) {
+    const watch = await getWatchLatest(userId);
+    const hr = watch.snapshot.heartRate != null ? `HR ${watch.snapshot.heartRate}` : "HR --";
+    const spo2 = watch.snapshot.spo2 != null ? `SpO2 ${watch.snapshot.spo2}` : "SpO2 --";
+    const temp = watch.snapshot.skinTemp != null ? `Temp ${watch.snapshot.skinTemp}` : "Temp --";
+    return `Latest watch vitals for ${watch.userId}: ${hr}, ${spo2}, ${temp}.`;
+  }
+
+  if (/(grocery|groceries|buy|order).*\b(order|book|place|need|want)\b|\b(order|book|place|need|want)\b.*(grocery|groceries|buy)/i.test(lower)) {
+    const item = pickItem(text, ["rice", "milk", "bread", "egg", "eggs", "banana", "apple", "atta", "dal", "sugar", "salt"]) || "milk";
+    const quantity = pickQuantity(lower) ?? 1;
+    const order = await placeGroceryOrder({
+      userId,
+      itemName: item,
+      quantity,
+      unit: "unit",
+      deliveryAddress: DEFAULT_ADDRESS,
+    });
+    return `Grocery order placed for ${quantity} ${item}. Order id: ${order.orderId}.`;
+  }
+
+  if (/(pharmacy|medicine|medicines|tablet|meds|drug)/i.test(lower) && /(order|book|place|need|want|buy)/i.test(lower)) {
+    const medicine =
+      pickItem(text, ["paracetamol", "dolo", "crocin", "calpol", "azithromycin", "vitamin c", "cetirizine"]) ||
+      "paracetamol";
+    const quantity = pickQuantity(lower) ?? 1;
+    const order = await placePharmacyOrder({
+      userId,
+      medicineName: medicine,
+      quantity,
+      unit: "strip",
+    });
+    return `Pharmacy order placed for ${quantity} ${medicine}. Order id: ${order.orderId}.`;
+  }
+
+  if (/(doctor|appointment|consult|book doctor|book appointment)/i.test(lower)) {
+    const mode = /(home|at home)/i.test(lower) ? "home" : "online";
+    const specialization = pickSpecialization(lower);
+    const appointmentTime = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
+    const appointment = await placeDoctorAppointment({
+      userId,
+      doctorName: "Available Doctor",
+      specialization,
+      appointmentTime,
+      mode,
+    });
+    return `Doctor appointment booked (${specialization}, ${mode}). Appointment id: ${appointment.appointmentId}.`;
+  }
+
+  return null;
+}
+
+function pickQuantity(text: string): number | null {
+  const match = text.match(/\b(\d{1,2})\b/);
+  if (!match) return null;
+  const qty = Number(match[1]);
+  if (!Number.isFinite(qty) || qty <= 0) return null;
+  return qty;
+}
+
+function pickItem(text: string, options: string[]): string | null {
+  const lower = text.toLowerCase();
+  for (const option of options) {
+    if (lower.includes(option.toLowerCase())) {
+      return option;
+    }
+  }
+
+  const orderFor = text.match(/(?:for|of)\s+([a-zA-Z\s]+?)(?:\.|,|$)/);
+  if (orderFor?.[1]) {
+    return orderFor[1].trim();
+  }
+
+  return null;
+}
+
+function pickSpecialization(text: string): string {
+  if (/heart|cardio/.test(text)) return "Cardiology";
+  if (/skin|derma/.test(text)) return "Dermatology";
+  if (/child|pediatric/.test(text)) return "Pediatrics";
+  if (/lung|breath|chest/.test(text)) return "Pulmonology";
+  if (/neuro|brain|headache/.test(text)) return "Neurology";
+  return "General Medicine";
 }
 
 function readHistory(): ChatMessage[] {
@@ -579,6 +785,19 @@ function formatTime(timestamp: number): string {
 function toErrorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   return String(error);
+}
+
+function formatFreefall(status?: string): string {
+  if (!status) return "Unknown";
+  return status;
+}
+
+function freefallClass(status?: string): string {
+  const normalized = (status || "").toLowerCase();
+  if (normalized.includes("alert") || normalized.includes("impact")) return "critical";
+  if (normalized.includes("free fall") || normalized.includes("stillness")) return "warn";
+  if (normalized.includes("normal")) return "ok";
+  return "neutral";
 }
 
 export default App;
