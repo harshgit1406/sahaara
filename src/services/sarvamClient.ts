@@ -1,0 +1,280 @@
+type ChatRole = "user" | "assistant";
+
+interface ChatMessage {
+  id: string;
+  role: ChatRole;
+  text: string;
+  timestamp: number;
+  mode: "voice" | "chat";
+}
+
+export interface SarvamConfig {
+  apiKey?: string;
+  baseUrl?: string;
+}
+
+type Env = ImportMetaEnv & {
+  readonly VITE_SARVAM_API_KEY?: string;
+  readonly VITE_SARVAM_BASE_URL?: string;
+  readonly VITE_SARVAM_LLM_ENDPOINT?: string;
+  readonly VITE_SARVAM_TTS_ENDPOINT?: string;
+  readonly VITE_SARVAM_STT_ENDPOINT?: string;
+  readonly VITE_SARVAM_LLM_MODEL?: string;
+  readonly VITE_SARVAM_TTS_MODEL?: string;
+  readonly VITE_SARVAM_TTS_SPEAKER?: string;
+  readonly VITE_SARVAM_TTS_LANG?: string;
+};
+
+const env = import.meta.env as Env;
+
+export function isSarvamConfigured() {
+  return Boolean(env.VITE_SARVAM_API_KEY?.trim());
+}
+
+function getSarvamConfig(overrides?: SarvamConfig) {
+  const apiKey = overrides?.apiKey?.trim() || env.VITE_SARVAM_API_KEY?.trim() || "";
+  const baseUrl = overrides?.baseUrl?.trim() || env.VITE_SARVAM_BASE_URL?.trim() || "https://api.sarvam.ai";
+
+  return {
+    apiKey,
+    baseUrl: baseUrl.replace(/\/+$/, ""),
+    llmEndpoint: env.VITE_SARVAM_LLM_ENDPOINT?.trim() || "/v1/chat/completions",
+    ttsEndpoint: env.VITE_SARVAM_TTS_ENDPOINT?.trim() || "/text-to-speech",
+    sttEndpoint: env.VITE_SARVAM_STT_ENDPOINT?.trim() || "/speech-to-text",
+    llmModel: env.VITE_SARVAM_LLM_MODEL?.trim() || "sarvam-m",
+    ttsModel: env.VITE_SARVAM_TTS_MODEL?.trim() || "bulbul:v3",
+    ttsSpeaker: env.VITE_SARVAM_TTS_SPEAKER?.trim() || "Ritu",
+    ttsLang: env.VITE_SARVAM_TTS_LANG?.trim() || "en-IN",
+  };
+}
+
+export async function llmReplyMock(prompt: string, history: ChatMessage[]): Promise<string> {
+  await wait(650);
+
+  const recentContext = history.slice(-4).map((item) => item.text).join(" ").slice(0, 280);
+  const cleanedPrompt = prompt.replace(/\s+/g, " ").trim();
+
+  return `I heard: "${cleanedPrompt}". I can help with health support, reminders, and guidance. ${
+    recentContext ? `I also considered recent context: ${recentContext}` : ""
+  }`;
+}
+
+export async function llmReplySarvam(prompt: string, history: ChatMessage[], config?: SarvamConfig): Promise<string> {
+  const resolved = getSarvamConfig(config);
+  ensureApiKey(resolved.apiKey);
+
+  const endpoint = toAbsoluteUrl(resolved.baseUrl, resolved.llmEndpoint);
+  const messages = history
+    .slice(-10)
+    .map((item) => ({ role: item.role, content: item.text }))
+    .concat([{ role: "user" as const, content: prompt }]);
+
+  const body = {
+    model: resolved.llmModel,
+    messages,
+    temperature: 0.6,
+  };
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "api-subscription-key": resolved.apiKey,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    throw new Error(await responseError("Sarvam LLM", response));
+  }
+
+  const payload = (await response.json()) as Record<string, unknown>;
+  const text = extractLlmText(payload);
+  if (!text) {
+    throw new Error("Sarvam LLM response did not include assistant text.");
+  }
+
+  return text;
+}
+
+export async function ttsSarvam(text: string, config?: SarvamConfig): Promise<ArrayBuffer> {
+  const resolved = getSarvamConfig(config);
+  ensureApiKey(resolved.apiKey);
+
+  const endpoint = toAbsoluteUrl(resolved.baseUrl, resolved.ttsEndpoint);
+
+  const attempts: Array<Record<string, unknown>> = [
+    {
+      inputs: [text],
+      target_language_code: resolved.ttsLang,
+      speaker: resolved.ttsSpeaker,
+      model: resolved.ttsModel,
+      enable_preprocessing: true,
+      pace: 1,
+    },
+    {
+      input: text,
+      target_language_code: resolved.ttsLang,
+      speaker: resolved.ttsSpeaker,
+      model: resolved.ttsModel,
+      enable_preprocessing: true,
+      pace: 1,
+    },
+    {
+      text,
+      target_language_code: resolved.ttsLang,
+      voice: resolved.ttsSpeaker,
+      model: resolved.ttsModel,
+      enable_preprocessing: true,
+      pace: 1,
+    },
+  ];
+
+  let lastError = "";
+
+  for (const body of attempts) {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "api-subscription-key": resolved.apiKey,
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (response.ok) {
+      const payload = (await response.json()) as { audios?: string[]; audio?: string };
+      const base64Audio = payload.audios?.[0] || payload.audio;
+      if (!base64Audio) {
+        throw new Error("Sarvam TTS response missing audio payload.");
+      }
+      return decodeBase64ToArrayBuffer(base64Audio);
+    }
+
+    lastError = await responseError("Sarvam TTS", response);
+    if (response.status === 401 || response.status === 403 || response.status === 429) {
+      break;
+    }
+  }
+
+  throw new Error(lastError || "Sarvam TTS request failed.");
+}
+
+export async function sttSarvam(audio: Blob, config?: SarvamConfig): Promise<string> {
+  const resolved = getSarvamConfig(config);
+  ensureApiKey(resolved.apiKey);
+
+  const endpoint = toAbsoluteUrl(resolved.baseUrl, resolved.sttEndpoint);
+  const formData = new FormData();
+  formData.append("file", audio, "speech.webm");
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "api-subscription-key": resolved.apiKey,
+    },
+    body: formData,
+  });
+
+  if (!response.ok) {
+    throw new Error(await responseError("Sarvam STT", response));
+  }
+
+  const payload = (await response.json()) as Record<string, unknown>;
+  const text = extractSttText(payload);
+  if (!text) {
+    throw new Error("Sarvam STT response did not include transcript text.");
+  }
+
+  return text;
+}
+
+function ensureApiKey(apiKey: string) {
+  if (!apiKey) {
+    throw new Error("Missing VITE_SARVAM_API_KEY in .env file.");
+  }
+}
+
+function toAbsoluteUrl(baseUrl: string, endpoint: string) {
+  if (/^https?:\/\//i.test(endpoint)) return endpoint;
+  return `${baseUrl}${endpoint.startsWith("/") ? "" : "/"}${endpoint}`;
+}
+
+function extractLlmText(payload: Record<string, unknown>): string {
+  const direct = asText(payload.reply) || asText(payload.output_text) || asText(payload.text) || asText(payload.response);
+  if (direct) return direct;
+
+  const choices = payload.choices;
+  if (Array.isArray(choices) && choices.length > 0) {
+    const first = choices[0] as Record<string, unknown>;
+    const message = first.message as Record<string, unknown> | undefined;
+    const content = asText(message?.content) || asText(first.text);
+    if (content) return content;
+  }
+
+  return "";
+}
+
+function extractSttText(payload: Record<string, unknown>): string {
+  return (
+    asText(payload.transcript) ||
+    asText(payload.text) ||
+    asText(payload.output_text) ||
+    asText(payload.response) ||
+    ""
+  );
+}
+
+function asText(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function decodeBase64ToArrayBuffer(base64: string): ArrayBuffer {
+  const normalized = base64.replace(/^data:audio\/[^;]+;base64,/, "");
+  const binary = atob(normalized);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes.buffer;
+}
+
+async function responseError(prefix: string, response: Response): Promise<string> {
+  const details = await extractResponseError(response);
+  return details ? `${prefix} ${response.status}: ${details}` : `${prefix} ${response.status}`;
+}
+
+async function extractResponseError(response: Response): Promise<string> {
+  const contentType = response.headers.get("content-type") ?? "";
+
+  if (contentType.includes("application/json")) {
+    const json = (await response.json().catch(() => null)) as
+      | {
+          message?: unknown;
+          error?: unknown;
+          detail?: unknown;
+          details?: unknown;
+        }
+      | null;
+
+    const candidate = json?.message ?? json?.error ?? json?.detail ?? json?.details ?? "";
+
+    if (typeof candidate === "string") return candidate.trim();
+    if (candidate == null) return "";
+    if (typeof candidate === "number" || typeof candidate === "boolean") return String(candidate);
+
+    try {
+      return JSON.stringify(candidate);
+    } catch {
+      return String(candidate);
+    }
+  }
+
+  return (await response.text().catch(() => "")).trim();
+}
+
+function wait(ms: number) {
+  return new Promise<void>((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
