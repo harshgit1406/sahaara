@@ -4,6 +4,7 @@ import "./components/Avatar/avatar.css";
 import { Avatar } from "./components/Avatar";
 import type { AvatarControls } from "./components/Avatar";
 import {
+  composeOrderConfirmationMessageSarvam,
   inferConfirmationDecisionSarvam,
   inferSahaaraIntentSarvam,
   isSarvamConfigured,
@@ -26,6 +27,7 @@ import {
 
 type ChatRole = "user" | "assistant";
 type InputMode = "voice" | "chat";
+type AssistantLanguageMode = "mix" | "english";
 
 interface ChatMessage {
   id: string;
@@ -78,6 +80,7 @@ function App() {
   const [healthError, setHealthError] = useState("");
   const [watchSnapshot, setWatchSnapshot] = useState<WatchPanelSnapshot | null>(null);
   const [pendingOrder, setPendingOrder] = useState<PreparedAssistantOrder | null>(null);
+  const [assistantLanguageMode, setAssistantLanguageMode] = useState<AssistantLanguageMode>("mix");
 
   const supportsRecording =
     typeof window !== "undefined" &&
@@ -200,6 +203,11 @@ function App() {
       const normalized = text.trim();
       if (!normalized) return;
 
+      const nextLanguageMode = resolveAssistantLanguageMode(normalized, assistantLanguageMode);
+      if (nextLanguageMode !== assistantLanguageMode) {
+        setAssistantLanguageMode(nextLanguageMode);
+      }
+
       const snapshot = messagesRef.current;
 
       appendMessage({
@@ -218,7 +226,11 @@ function App() {
         appendMessage({
           id: crypto.randomUUID(),
           role: "assistant",
-          text: "Placing order...",
+          text: chooseReply(
+            nextLanguageMode,
+            "Order process start ho gaya hai, details verify kar rahi hoon...",
+            "Order process started, verifying details..."
+          ),
           timestamp: Date.now(),
           mode: "chat",
         });
@@ -227,39 +239,58 @@ function App() {
       let reply = "";
 
       try {
-        const confirmationDecision = pendingOrder
+        if (isLanguagePreferenceCommand(normalized)) {
+          reply =
+            nextLanguageMode === "english"
+              ? "Sure. I will reply in English from now on."
+              : "Theek hai. Ab se main Hindi + English mix mein reply karungi.";
+        } else {
+          const confirmationDecision = pendingOrder
           ? await inferConfirmationDecision(normalized, pendingOrder)
           : "unclear";
 
-        if (pendingOrder && confirmationDecision === "confirm") {
-          const confirmed = await confirmPreparedOrder(pendingOrder, true);
-          setPendingOrder(null);
-          if (confirmed.kind === "doctor") {
-            const doctorName = confirmed.doctorName || pendingOrder.itemName;
-            const fee = confirmed.fee ?? pendingOrder.unitPrice;
-            const mode = pendingOrder.doctorMode || "online";
-            const slot = confirmed.slot || "Slot confirmation shared shortly";
-            reply = `Confirmed. Doctor appointment booked. Doctor: ${doctorName}. Mode: ${mode}. Fee: Rs ${fee}. Slot: ${slot}.`;
+          if (pendingOrder && confirmationDecision === "confirm") {
+            const confirmed = await confirmPreparedOrder(pendingOrder, true);
+            setPendingOrder(null);
+            if (confirmed.kind === "doctor") {
+              const doctorName = confirmed.doctorName || pendingOrder.itemName;
+              const fee = confirmed.fee ?? pendingOrder.unitPrice;
+              const visitMode = pendingOrder.doctorMode || "online";
+              const slot = confirmed.slot || "Slot confirmation shared shortly";
+              reply = chooseReply(
+                nextLanguageMode,
+                `Confirm ho gaya. Doctor appointment book ho gaya. Doctor: ${doctorName}. Mode: ${visitMode}. Fee: Rs ${fee}. Slot: ${slot}.`,
+                `Confirmed. Doctor appointment booked. Doctor: ${doctorName}. Mode: ${visitMode}. Fee: Rs ${fee}. Slot: ${slot}.`
+              );
+            } else {
+              const itemName = confirmed.itemName || confirmed.medicineName || pendingOrder.itemName;
+              const quantity = pendingOrder.quantity;
+              const total = pendingOrder.totalPrice;
+              reply = chooseReply(
+                nextLanguageMode,
+                `Confirm ho gaya. Order place ho gaya for ${itemName}. Quantity: ${quantity}. Total: Rs ${total}. Estimated delivery: 30 to 40 minutes.`,
+                `Confirmed. Order placed for ${itemName}. Quantity: ${quantity}. Total: Rs ${total}. Estimated delivery: 30 to 40 minutes.`
+              );
+            }
+          } else if (pendingOrder && confirmationDecision === "cancel") {
+            await confirmPreparedOrder(pendingOrder, false);
+            setPendingOrder(null);
+            reply = chooseReply(nextLanguageMode, "Cancel kar diya. Order place nahi hua.", "Cancelled. No order was placed.");
+          } else if (pendingOrder && isOrderIntentMessage(normalized)) {
+            reply = await buildConfirmationPrompt(nextLanguageMode, pendingOrder, true);
+          } else if (pendingOrder && confirmationDecision === "unclear") {
+            reply = chooseReply(
+              nextLanguageMode,
+              `Mujhe clearly samajh nahi aaya. ${pendingOrder.itemName} place karne ke liye "confirm" bolo, ya stop ke liye "cancel" bolo.`,
+              `I did not clearly catch that. Please reply "confirm" to place ${pendingOrder.itemName}, or "cancel" to stop.`
+            );
           } else {
-            const itemName = confirmed.itemName || confirmed.medicineName || pendingOrder.itemName;
-            const quantity = pendingOrder.quantity;
-            const total = pendingOrder.totalPrice;
-            reply = `Confirmed. Order placed for ${itemName}. Quantity: ${quantity}. Total: Rs ${total}. Estimated delivery: 30 to 40 minutes.`;
-          }
-        } else if (pendingOrder && confirmationDecision === "cancel") {
-          await confirmPreparedOrder(pendingOrder, false);
-          setPendingOrder(null);
-          reply = "Cancelled. No order was placed.";
-        } else if (pendingOrder && isOrderIntentMessage(normalized)) {
-          reply = `Pending confirmation: ${pendingOrder.itemName}, qty ${pendingOrder.quantity}, price Rs ${pendingOrder.unitPrice} each (total Rs ${pendingOrder.totalPrice}). Reply "confirm" to place or "cancel" to stop.`;
-        } else if (pendingOrder && confirmationDecision === "unclear") {
-          reply = `I did not clearly catch that. Please reply "confirm" to place ${pendingOrder.itemName}, or "cancel" to stop.`;
-        } else {
-          const actionReply = await tryHandleSahaaraAction(normalized);
-          if (actionReply) {
-            reply = actionReply.reply;
-            if (actionReply.pendingOrder) {
-              setPendingOrder(actionReply.pendingOrder);
+            const actionReply = await tryHandleSahaaraAction(normalized, nextLanguageMode);
+            if (actionReply) {
+              reply = actionReply.reply;
+              if (actionReply.pendingOrder) {
+                setPendingOrder(actionReply.pendingOrder);
+              }
             }
           }
         }
@@ -270,13 +301,13 @@ function App() {
       if (!reply) {
         if (isSarvamConfigured()) {
           try {
-            reply = await llmReplySarvam(normalized, snapshot);
+            reply = await llmReplySarvam(normalized, snapshot, undefined, nextLanguageMode);
           } catch (error) {
             setStatus(`LLM fallback: ${toErrorMessage(error)}`);
-            reply = await llmReplyMock(normalized, snapshot);
+            reply = await llmReplyMock(normalized, snapshot, nextLanguageMode);
           }
         } else {
-          reply = await llmReplyMock(normalized, snapshot);
+          reply = await llmReplyMock(normalized, snapshot, nextLanguageMode);
         }
       }
 
@@ -296,7 +327,7 @@ function App() {
         await speakReply(reply);
       }
     },
-    [appendMessage, isChatOnly, pendingOrder, speakReply]
+    [appendMessage, assistantLanguageMode, isChatOnly, pendingOrder, speakReply]
   );
 
   const processVoiceBlob = useCallback(
@@ -716,13 +747,13 @@ function App() {
   );
 }
 
-async function tryHandleSahaaraAction(text: string): Promise<ActionReply | null> {
+async function tryHandleSahaaraAction(text: string, languageMode: AssistantLanguageMode): Promise<ActionReply | null> {
   const lower = text.toLowerCase();
   const userId = getWatchUserId();
 
   const llmPlan = await inferActionPlan(text);
   if (llmPlan) {
-    const planned = await handleActionPlan(llmPlan, text, userId);
+    const planned = await handleActionPlan(llmPlan, text, userId, languageMode);
     if (planned) {
       return planned;
     }
@@ -744,8 +775,8 @@ async function tryHandleSahaaraAction(text: string): Promise<ActionReply | null>
     const health = await getSahaaraHealth();
     return {
       reply: health.firebase.initialized
-        ? "Sahaara API is connected and Firebase is initialized."
-        : "Sahaara API is reachable but Firebase is not initialized yet.",
+        ? chooseReply(languageMode, "Sahaara API connected hai aur Firebase initialized hai.", "Sahaara API is connected and Firebase is initialized.")
+        : chooseReply(languageMode, "Sahaara API reachable hai, lekin Firebase abhi initialized nahi hai.", "Sahaara API is reachable but Firebase is not initialized yet."),
     };
   }
 
@@ -754,7 +785,13 @@ async function tryHandleSahaaraAction(text: string): Promise<ActionReply | null>
     const hr = watch.snapshot.heartRate != null ? `HR ${watch.snapshot.heartRate}` : "HR --";
     const spo2 = watch.snapshot.spo2 != null ? `SpO2 ${watch.snapshot.spo2}` : "SpO2 --";
     const temp = watch.snapshot.skinTemp != null ? `Temp ${watch.snapshot.skinTemp}` : "Temp --";
-    return { reply: `Latest watch vitals for ${watch.userId}: ${hr}, ${spo2}, ${temp}.` };
+    return {
+      reply: chooseReply(
+        languageMode,
+        `Latest watch vitals ${watch.userId} ke liye: ${hr}, ${spo2}, ${temp}.`,
+        `Latest watch vitals for ${watch.userId}: ${hr}, ${spo2}, ${temp}.`
+      ),
+    };
   }
 
   if (hasOrderVerb && groceryHint) {
@@ -769,7 +806,7 @@ async function tryHandleSahaaraAction(text: string): Promise<ActionReply | null>
       deliveryAddress: DEFAULT_ADDRESS,
     });
     return {
-      reply: `Please confirm grocery order: ${order.itemName}, qty ${order.quantity}, price Rs ${order.unitPrice} each (total Rs ${order.totalPrice}). Reply "confirm" to place or "cancel" to stop.`,
+      reply: await buildConfirmationPrompt(languageMode, order),
       pendingOrder: order,
     };
   }
@@ -787,7 +824,7 @@ async function tryHandleSahaaraAction(text: string): Promise<ActionReply | null>
       unit: "strip",
     });
     return {
-      reply: `Please confirm pharmacy order: ${order.itemName}, qty ${order.quantity}, price Rs ${order.unitPrice} each (total Rs ${order.totalPrice}). Reply "confirm" to place or "cancel" to stop.`,
+      reply: await buildConfirmationPrompt(languageMode, order),
       pendingOrder: order,
     };
   }
@@ -804,7 +841,7 @@ async function tryHandleSahaaraAction(text: string): Promise<ActionReply | null>
       mode,
     });
     return {
-      reply: `Please confirm doctor booking: ${appointment.itemName}, mode ${appointment.doctorMode || mode}, fee Rs ${appointment.unitPrice}. Reply "confirm" to book or "cancel" to stop.`,
+      reply: await buildConfirmationPrompt(languageMode, appointment),
       pendingOrder: appointment,
     };
   }
@@ -849,7 +886,12 @@ async function inferConfirmationDecision(
   return "unclear";
 }
 
-async function handleActionPlan(plan: SahaaraIntentPlan, text: string, userId: string): Promise<ActionReply | null> {
+async function handleActionPlan(
+  plan: SahaaraIntentPlan,
+  text: string,
+  userId: string,
+  languageMode: AssistantLanguageMode,
+): Promise<ActionReply | null> {
   if (plan.action === "none") {
     return null;
   }
@@ -858,8 +900,8 @@ async function handleActionPlan(plan: SahaaraIntentPlan, text: string, userId: s
     const health = await getSahaaraHealth();
     return {
       reply: health.firebase.initialized
-        ? "Sahaara API is connected and Firebase is initialized."
-        : "Sahaara API is reachable but Firebase is not initialized yet.",
+        ? chooseReply(languageMode, "Sahaara API connected hai aur Firebase initialized hai.", "Sahaara API is connected and Firebase is initialized.")
+        : chooseReply(languageMode, "Sahaara API reachable hai, lekin Firebase abhi initialized nahi hai.", "Sahaara API is reachable but Firebase is not initialized yet."),
     };
   }
 
@@ -868,7 +910,13 @@ async function handleActionPlan(plan: SahaaraIntentPlan, text: string, userId: s
     const hr = watch.snapshot.heartRate != null ? `HR ${watch.snapshot.heartRate}` : "HR --";
     const spo2 = watch.snapshot.spo2 != null ? `SpO2 ${watch.snapshot.spo2}` : "SpO2 --";
     const temp = watch.snapshot.skinTemp != null ? `Temp ${watch.snapshot.skinTemp}` : "Temp --";
-    return { reply: `Latest watch vitals for ${watch.userId}: ${hr}, ${spo2}, ${temp}.` };
+    return {
+      reply: chooseReply(
+        languageMode,
+        `Latest watch vitals ${watch.userId} ke liye: ${hr}, ${spo2}, ${temp}.`,
+        `Latest watch vitals for ${watch.userId}: ${hr}, ${spo2}, ${temp}.`
+      ),
+    };
   }
 
   if (plan.action === "grocery_order") {
@@ -884,7 +932,7 @@ async function handleActionPlan(plan: SahaaraIntentPlan, text: string, userId: s
       deliveryAddress: DEFAULT_ADDRESS,
     });
     return {
-      reply: `Please confirm grocery order: ${order.itemName}, qty ${order.quantity}, price Rs ${order.unitPrice} each (total Rs ${order.totalPrice}). Reply "confirm" to place or "cancel" to stop.`,
+      reply: await buildConfirmationPrompt(languageMode, order),
       pendingOrder: order,
     };
   }
@@ -903,7 +951,7 @@ async function handleActionPlan(plan: SahaaraIntentPlan, text: string, userId: s
       unit: "strip",
     });
     return {
-      reply: `Please confirm pharmacy order: ${order.itemName}, qty ${order.quantity}, price Rs ${order.unitPrice} each (total Rs ${order.totalPrice}). Reply "confirm" to place or "cancel" to stop.`,
+      reply: await buildConfirmationPrompt(languageMode, order),
       pendingOrder: order,
     };
   }
@@ -920,7 +968,7 @@ async function handleActionPlan(plan: SahaaraIntentPlan, text: string, userId: s
       mode,
     });
     return {
-      reply: `Please confirm doctor booking: ${appointment.itemName}, mode ${appointment.doctorMode || mode}, fee Rs ${appointment.unitPrice}. Reply "confirm" to book or "cancel" to stop.`,
+      reply: await buildConfirmationPrompt(languageMode, appointment),
       pendingOrder: appointment,
     };
   }
@@ -938,6 +986,65 @@ function isCancelReply(text: string): boolean {
 
 function isOrderIntentMessage(text: string): boolean {
   return /\b(order|book|buy|get|medicine|grocery|doctor|appointment|atta|pharmacy)\b/i.test(text);
+}
+
+function chooseReply(mode: AssistantLanguageMode, mixText: string, englishText: string): string {
+  return mode === "english" ? englishText : mixText;
+}
+
+function resolveAssistantLanguageMode(text: string, current: AssistantLanguageMode): AssistantLanguageMode {
+  if (/\b(english|only english|in english|speak english|talk in english)\b/i.test(text)) {
+    return "english";
+  }
+  if (/\b(hindi|hinglish|mix|hindi me|hindi mein|hindi english)\b/i.test(text)) {
+    return "mix";
+  }
+  return current;
+}
+
+function isLanguagePreferenceCommand(text: string): boolean {
+  return /(speak|talk|reply|respond).*(english|hindi|hinglish|mix)|\b(only english|in english|hindi me|hindi mein)\b/i.test(text);
+}
+
+async function buildConfirmationPrompt(
+  languageMode: AssistantLanguageMode,
+  order: PreparedAssistantOrder,
+  reminder = false,
+): Promise<string> {
+  if (isSarvamConfigured()) {
+    try {
+      const llmText = await composeOrderConfirmationMessageSarvam({
+        kind: order.kind,
+        itemName: order.itemName,
+        quantity: order.quantity,
+        unitPrice: order.unitPrice,
+        totalPrice: order.totalPrice,
+        doctorMode: order.doctorMode,
+        mode: languageMode,
+        reminder,
+      });
+      if (llmText && llmText.trim()) {
+        return llmText.trim();
+      }
+    } catch {
+      // fallback text below
+    }
+  }
+
+  if (order.kind === "doctor") {
+    return chooseReply(
+      languageMode,
+      `Doctor booking confirm kariye: ${order.itemName}, mode ${order.doctorMode || "online"}, fee Rs ${order.unitPrice}. Book karne ke liye "confirm" bolo, cancel ke liye "cancel" bolo.`,
+      `Please confirm doctor booking: ${order.itemName}, mode ${order.doctorMode || "online"}, fee Rs ${order.unitPrice}. Reply "confirm" to book or "cancel" to stop.`
+    );
+  }
+
+  const prefix = order.kind === "pharmacy" ? "Pharmacy" : "Grocery";
+  return chooseReply(
+    languageMode,
+    `${prefix} order confirm kariye: ${order.itemName}, qty ${order.quantity}, price Rs ${order.unitPrice} each (total Rs ${order.totalPrice}). Place karne ke liye "confirm" bolo, cancel ke liye "cancel" bolo.`,
+    `Please confirm ${order.kind} order: ${order.itemName}, qty ${order.quantity}, price Rs ${order.unitPrice} each (total Rs ${order.totalPrice}). Reply "confirm" to place or "cancel" to stop.`
+  );
 }
 
 const GROCERY_CANONICAL = ["atta", "rice", "milk", "bread", "eggs", "banana", "apple", "dal", "sugar", "salt"] as const;

@@ -8,6 +8,19 @@ interface ChatMessage {
   mode: "voice" | "chat";
 }
 
+type AssistantReplyMode = "mix" | "english";
+
+export interface OrderConfirmationMessageInput {
+  kind: "grocery" | "pharmacy" | "doctor";
+  itemName: string;
+  quantity: number;
+  unitPrice: number;
+  totalPrice: number;
+  doctorMode?: "online" | "home";
+  mode?: AssistantReplyMode;
+  reminder?: boolean;
+}
+
 export type SahaaraIntentAction = "none" | "grocery_order" | "pharmacy_order" | "doctor_booking" | "watch_vitals" | "api_health";
 
 export interface SahaaraIntentPlan {
@@ -74,26 +87,50 @@ function getSarvamConfig(overrides?: SarvamConfig) {
   };
 }
 
-export async function llmReplyMock(prompt: string, history: ChatMessage[]): Promise<string> {
+export async function llmReplyMock(
+  prompt: string,
+  history: ChatMessage[],
+  mode: AssistantReplyMode = "mix",
+): Promise<string> {
   await wait(650);
 
   const recentContext = history.slice(-4).map((item) => item.text).join(" ").slice(0, 280);
   const cleanedPrompt = prompt.replace(/\s+/g, " ").trim();
 
-  return `I heard: "${cleanedPrompt}". I can help with health support, reminders, and guidance. ${
-    recentContext ? `I also considered recent context: ${recentContext}` : ""
+  if (mode === "english") {
+    return `I heard: "${cleanedPrompt}". I can help with health support, reminders, and guidance. ${
+      recentContext ? `I also considered recent context: ${recentContext}` : ""
+    }`;
+  }
+
+  return `Maine suna: "${cleanedPrompt}". Main health support, reminders, aur guidance mein help kar sakti hoon. ${
+    recentContext ? `Maine recent context bhi consider kiya: ${recentContext}` : ""
   }`;
 }
 
-export async function llmReplySarvam(prompt: string, history: ChatMessage[], config?: SarvamConfig): Promise<string> {
+export async function llmReplySarvam(
+  prompt: string,
+  history: ChatMessage[],
+  config?: SarvamConfig,
+  mode: AssistantReplyMode = "mix",
+): Promise<string> {
   const resolved = getSarvamConfig(config);
   ensureApiKey(resolved.apiKey);
 
   const endpoint = toAbsoluteUrl(resolved.baseUrl, resolved.llmEndpoint);
-  const messages = history
+  const styleInstruction =
+    mode === "english"
+      ? "Reply in clear English only."
+      : "Reply in natural Hindi + English mix (Hinglish). Keep it concise and friendly.";
+
+  const historyMessages: LlmMessage[] = history
     .slice(-10)
-    .map((item) => ({ role: item.role, content: item.text }))
-    .concat([{ role: "user" as const, content: prompt }]);
+    .map((item): LlmMessage => ({ role: item.role as "user" | "assistant", content: item.text }));
+  const messages: LlmMessage[] = [
+    { role: "system", content: styleInstruction },
+    ...historyMessages,
+    { role: "user", content: prompt },
+  ];
 
   const body = {
     model: resolved.llmModel,
@@ -269,6 +306,70 @@ export async function inferConfirmationDecisionSarvam(
   const confidence = Number.isFinite(confRaw) ? Math.max(0, Math.min(1, confRaw)) : undefined;
 
   return { decision, confidence };
+}
+
+export async function composeOrderConfirmationMessageSarvam(
+  input: OrderConfirmationMessageInput,
+  config?: SarvamConfig,
+): Promise<string | null> {
+  const resolved = getSarvamConfig(config);
+  ensureApiKey(resolved.apiKey);
+
+  const endpoint = toAbsoluteUrl(resolved.baseUrl, resolved.llmEndpoint);
+  const mode = input.mode || "mix";
+  const styleInstruction =
+    mode === "english"
+      ? "Write in polite English only."
+      : "Write in polite respectful Hinglish (Hindi + English mix), concise, clear, and warm.";
+
+  const templateHint =
+    mode === "english"
+      ? "Use this style: Please confirm the order for <item> with value Rs <amount>."
+      : "Use this style idea naturally: '<item> ko mangane ke liye jiski value Rs <amount> hai, kripya confirm kariye.'";
+
+  const context = [
+    `kind=${input.kind}`,
+    `item=${input.itemName}`,
+    `quantity=${input.quantity}`,
+    `unitPrice=${input.unitPrice}`,
+    `totalPrice=${input.totalPrice}`,
+    `doctorMode=${input.doctorMode || "na"}`,
+    `reminder=${Boolean(input.reminder)}`,
+  ].join(", ");
+
+  const systemPrompt =
+    `${styleInstruction} You are a transactional assistant writing order confirmation prompts.` +
+    ` Mention item, quantity and amount clearly. Ask user to reply confirm/cancel.` +
+    ` Do not use words like 'karo'. Prefer respectful phrasing like 'kariye'.` +
+    ` ${templateHint} Return plain text only.`;
+
+  const messages: LlmMessage[] = [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: `Generate confirmation prompt for: ${context}` },
+  ];
+
+  const body = {
+    model: resolved.llmModel,
+    messages,
+    temperature: 0.3,
+  };
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "api-subscription-key": resolved.apiKey,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    throw new Error(await responseError("Sarvam confirmation-msg", response));
+  }
+
+  const payload = (await response.json()) as Record<string, unknown>;
+  const text = extractLlmText(payload);
+  return text || null;
 }
 
 export async function ttsSarvam(text: string, config?: SarvamConfig): Promise<ArrayBuffer> {
