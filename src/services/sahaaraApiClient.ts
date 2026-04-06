@@ -78,6 +78,13 @@ interface WatchLatestData {
   snapshot: WatchLatestSnapshot["snapshot"];
 }
 
+interface WatchFreefallData {
+  userId: string;
+  freefall: {
+    status?: string;
+  };
+}
+
 interface AgentTaskRecord {
   id: string;
   target: string;
@@ -180,6 +187,8 @@ export interface ConfirmedAssistantOrder {
 const env = import.meta.env as Env;
 const DEFAULT_BASE_URL = "https://sahaara-api.vercel.app";
 const DEFAULT_WATCH_USER_ID = "user123";
+const ORDER_CONFIRMATION_POLL_START_DELAY_MS = 5000;
+const ORDER_CONFIRMATION_POLL_INTERVAL_MS = 1500;
 
 function resolveBaseUrl() {
   return (env.VITE_SAHAARA_API_BASE_URL?.trim() || DEFAULT_BASE_URL).replace(/\/+$/, "");
@@ -305,13 +314,15 @@ async function waitForPendingConfirmationByType(
   timeoutMs = 12000,
 ): Promise<UiConfirmationRecord | null> {
   const started = Date.now();
+  await sleep(ORDER_CONFIRMATION_POLL_START_DELAY_MS);
+
   while (Date.now() - started < timeoutMs) {
     const pending = await listPendingConfirmations();
     const match = pending.find((item) => item.type === type && Number(item.createdAt || 0) >= minCreatedAt - 5000);
     if (match) {
       return match;
     }
-    await sleep(900);
+    await sleep(ORDER_CONFIRMATION_POLL_INTERVAL_MS);
   }
   return null;
 }
@@ -527,6 +538,15 @@ export async function getWatchLatest(userId: string): Promise<WatchLatestSnapsho
     userId: payload.data.userId,
     snapshot: payload.data.snapshot || {},
   };
+}
+
+export async function getWatchFreefallLatest(userId: string): Promise<string | null> {
+  const payload = await request<WatchFreefallData>(`/api/watch/freefall/latest/${encodeURIComponent(userId)}`, {
+    method: "GET",
+  });
+
+  const status = payload.data.freefall?.status;
+  return typeof status === "string" && status.trim() ? status.trim() : null;
 }
 
 export async function queueAgentTask(input: QueueAgentTaskInput): Promise<AgentTaskRecord> {

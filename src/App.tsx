@@ -25,6 +25,7 @@ import {
   listMedicineReminders,
   type MedicineReminder,
   getWatchLatest,
+  getWatchFreefallLatest,
   getWatchUserId,
   prepareDoctorAppointment,
   prepareGroceryOrder,
@@ -154,22 +155,35 @@ function App() {
     ]);
   }, []);
 
-  const loadWatchSnapshot = useCallback(async () => {
+  const loadWatchVitals = useCallback(async () => {
     setHealthLoading(true);
     setHealthError("");
     try {
       const userId = getWatchUserId();
       const latest = await getWatchLatest(userId);
-      setWatchSnapshot({
+      setWatchSnapshot((prev) => ({
+        ...(prev || {}),
         heartRate: latest.snapshot.heartRate,
         spo2: latest.snapshot.spo2,
         skinTemp: latest.snapshot.skinTemp,
-        freefallStatus: latest.snapshot.freefallStatus,
-      });
+      }));
     } catch (error) {
       setHealthError(toErrorMessage(error));
     } finally {
       setHealthLoading(false);
+    }
+  }, []);
+
+  const loadWatchFreefall = useCallback(async () => {
+    try {
+      const userId = getWatchUserId();
+      const freefallStatus = await getWatchFreefallLatest(userId);
+      setWatchSnapshot((prev) => ({
+        ...(prev || {}),
+        freefallStatus: freefallStatus || undefined,
+      }));
+    } catch {
+      // keep existing freefall status on transient failures
     }
   }, []);
 
@@ -319,17 +333,21 @@ function App() {
 
       const shouldShowPlacingOrder = !pendingOrder && isOrderIntentMessage(normalized);
       if (shouldShowPlacingOrder) {
+        const placingOrderText = chooseReply(
+          nextLanguageMode,
+          "Order process start ho gaya hai, details verify kar rahi hoon...",
+          "Order process started, verifying details..."
+        );
         appendMessage({
           id: crypto.randomUUID(),
           role: "assistant",
-          text: chooseReply(
-            nextLanguageMode,
-            "Order process start ho gaya hai, details verify kar rahi hoon...",
-            "Order process started, verifying details..."
-          ),
+          text: placingOrderText,
           timestamp: Date.now(),
           mode: "chat",
         });
+        if (!isChatOnly && mode === "voice") {
+          await speakReply(placingOrderText, true);
+        }
       }
 
       let reply = "";
@@ -364,14 +382,30 @@ function App() {
             );
           }
         } else {
+          const directDecision = pendingOrder
+            ? isConfirmReply(normalized)
+              ? "confirm"
+              : isCancelReply(normalized)
+                ? "cancel"
+                : null
+            : null;
+
           const confirmationDecision = pendingOrder
-          ? await inferConfirmationDecision(normalized, pendingOrder)
-          : "unclear";
+            ? directDecision || (await inferConfirmationDecision(normalized, pendingOrder))
+            : "unclear";
 
           if (pendingOrder && confirmationDecision === "confirm") {
+            setStatus("Confirming with API");
             const confirmed = await confirmPreparedOrder(pendingOrder, true);
-            setPendingOrder(null);
-            if (confirmed.kind === "doctor") {
+            if (confirmed.status !== "confirmed") {
+              setPendingOrder(null);
+              reply = chooseReply(
+                nextLanguageMode,
+                "Confirmation receive nahi hui ya request cancel ho gayi. Order place nahi hua.",
+                "Confirmation was not received or the request was cancelled. No order was placed."
+              );
+            } else if (confirmed.kind === "doctor") {
+              setPendingOrder(null);
               const doctorName = confirmed.doctorName || pendingOrder.itemName;
               const fee = confirmed.fee ?? pendingOrder.unitPrice;
               const visitMode = pendingOrder.doctorMode || "online";
@@ -382,6 +416,7 @@ function App() {
                 `Confirmed. Doctor appointment booked. Doctor: ${doctorName}. Mode: ${visitMode}. Fee: Rs ${fee}. Slot: ${slot}.`
               );
             } else {
+              setPendingOrder(null);
               const itemName = confirmed.itemName || confirmed.medicineName || pendingOrder.itemName;
               const quantity = pendingOrder.quantity;
               const total = pendingOrder.totalPrice;
@@ -700,15 +735,13 @@ function App() {
   ]);
 
   useEffect(() => {
+    if (!showReminderPanel) return;
     void loadReminders();
-  }, [loadReminders]);
-
-  useEffect(() => {
     const timer = window.setInterval(() => {
       void loadReminders();
     }, 45000);
     return () => window.clearInterval(timer);
-  }, [loadReminders]);
+  }, [loadReminders, showReminderPanel]);
 
   useEffect(() => {
     if (reminders.length === 0) return;
@@ -756,12 +789,19 @@ function App() {
 
   useEffect(() => {
     if (!showHealthPanel) return;
-    void loadWatchSnapshot();
-    const timer = window.setInterval(() => {
-      void loadWatchSnapshot();
-    }, 8000);
-    return () => window.clearInterval(timer);
-  }, [loadWatchSnapshot, showHealthPanel]);
+    void loadWatchVitals();
+    void loadWatchFreefall();
+    const vitalsTimer = window.setInterval(() => {
+      void loadWatchVitals();
+    }, 60000);
+    const freefallTimer = window.setInterval(() => {
+      void loadWatchFreefall();
+    }, 5000);
+    return () => {
+      window.clearInterval(vitalsTimer);
+      window.clearInterval(freefallTimer);
+    };
+  }, [loadWatchFreefall, loadWatchVitals, showHealthPanel]);
 
   const handleSend = useCallback(
     async (event: React.FormEvent) => {
@@ -1085,17 +1125,18 @@ async function tryHandleSahaaraAction(
     }
   }
 
-  const hasOrderVerb = /\b(order|book|place|get|buy|need|want|arrange|send)\b/i.test(lower);
+  const hasOrderVerb =
+    /\b(order|book|place|get|buy|need|want|arrange|send)\b/i.test(lower) ||
+    /(ऑर्डर|आर्डर|बुक|मंगा|मंगवा|भेज|भिजवा|दिलवा|चाहिए)/i.test(text);
   const groceryHint =
-    /\b(grocery|groceries|ration|atta|rice|milk|bread|egg|eggs|banana|apple|dal|sugar|salt|flour)\b/i.test(lower);
+    /\b(grocery|groceries|ration|atta|rice|milk|bread|egg|eggs|banana|apple|dal|sugar|salt|flour)\b/i.test(lower) ||
+    /(किराना|राशन|आटा|चावल|दूध|ब्रेड|अंडा|अंडे|दाल|चीनी|नमक)/i.test(text);
   const medicineHint =
-    /\b(pharmacy|medicine|medicines|tablet|tablets|meds|drug|paracetamol|dolo|crocin|calpol|cetirizine|azithromycin|vitamin c)\b/i.test(
-      lower
-    );
+    /\b(pharmacy|medicine|medicines|tablet|tablets|meds|drug|paracetamol|dolo|crocin|calpol|cetirizine|azithromycin|vitamin c)\b/i.test(lower) ||
+    /(दवा|दवाई|मेडिसिन|फार्मेसी|टेबलेट|गोली|पैरासिटामोल)/i.test(text);
   const doctorHint =
-    /\b(doctor|appointment|consult|physician|cardio|cardiologist|derma|dermatology|pediatric|neurology|pulmonology)\b/i.test(
-      lower
-    );
+    /\b(doctor|appointment|consult|physician|cardio|cardiologist|derma|dermatology|pediatric|neurology|pulmonology)\b/i.test(lower) ||
+    /(डॉक्टर|अपॉइंटमेंट|कंसल्ट|चिकित्सक)/i.test(text);
   const prescriptionList = uniquePrescriptionMedicineNames(prescriptionReminders);
 
   if (/(api health|health status|backend status|server status)/i.test(lower)) {
@@ -1231,6 +1272,9 @@ async function inferConfirmationDecision(
   text: string,
   pendingOrder: PreparedAssistantOrder,
 ): Promise<"confirm" | "cancel" | "unclear"> {
+  if (isConfirmReply(text)) return "confirm";
+  if (isCancelReply(text)) return "cancel";
+
   if (isSarvamConfigured()) {
     try {
       const plan = await inferConfirmationDecisionSarvam(text, {
@@ -1247,8 +1291,6 @@ async function inferConfirmationDecision(
     }
   }
 
-  if (isConfirmReply(text)) return "confirm";
-  if (isCancelReply(text)) return "cancel";
   return "unclear";
 }
 
@@ -1388,15 +1430,26 @@ async function handleActionPlan(
 }
 
 function isConfirmReply(text: string): boolean {
-  return /\b(confirm|yes|proceed|place|book it|do it|ok|okay|go ahead)\b/i.test(text);
+  return (
+    /\b(confirm|confirmed|confirmation|yes|haan|han|ha|proceed|place|book it|do it|ok|okay|go ahead|kar do|kardo|kar dijiye|kar deejiye|sure|approved)\b/i.test(
+      text
+    ) ||
+    /(कन्फर्म|कंफर्म|कन्फ़र्म|कंफ़र्म|पक्का|हाँ|हां|हाँजी|हांजी|कर दो|करदो|कर दीजिए|करदीजिए|ओके)/i.test(text)
+  );
 }
 
 function isCancelReply(text: string): boolean {
-  return /\b(cancel|no|stop|don\s*'?t|do not)\b/i.test(text);
+  return (
+    /\b(cancel|cancelled|no|nahi|nahin|mat|stop|don\s*'?t|do not|band karo|rehne do|mat karo)\b/i.test(text) ||
+    /(रद्द|कैंसल|कॅन्सल|नहीं|नही|मत|रोक दो|रहने दो|बंद करो)/i.test(text)
+  );
 }
 
 function isOrderIntentMessage(text: string): boolean {
-  return /\b(order|book|buy|get|medicine|grocery|doctor|appointment|atta|pharmacy)\b/i.test(text);
+  return (
+    /\b(order|book|buy|get|medicine|grocery|doctor|appointment|atta|pharmacy)\b/i.test(text) ||
+    /(ऑर्डर|आर्डर|मंगा|मंगवा|दवा|दवाई|मेडिसिन|किराना|डॉक्टर|अपॉइंटमेंट|आटा|फार्मेसी)/i.test(text)
+  );
 }
 
 function chooseReply(mode: AssistantLanguageMode, mixText: string, englishText: string): string {
