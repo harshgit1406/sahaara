@@ -40,6 +40,14 @@ export interface ConfirmationPlan {
   confidence?: number;
 }
 
+export interface PharmacyOrderGuardPlan {
+  decision: "allow" | "deny";
+  medicineName?: string;
+  requiresPrescription?: boolean;
+  reason?: string;
+  confidence?: number;
+}
+
 type LlmRole = "system" | "user" | "assistant";
 
 interface LlmMessage {
@@ -509,6 +517,74 @@ function extractSttText(payload: Record<string, unknown>): string {
     asText(payload.response) ||
     ""
   );
+}
+
+export async function inferPharmacyOrderGuardSarvam(
+  prompt: string,
+  context?: {
+    medicineName?: string;
+    prescriptionMedicines?: string[];
+  },
+  config?: SarvamConfig,
+): Promise<PharmacyOrderGuardPlan | null> {
+  const resolved = getSarvamConfig(config);
+  ensureApiKey(resolved.apiKey);
+
+  const endpoint = toAbsoluteUrl(resolved.baseUrl, resolved.llmEndpoint);
+  const listed = Array.isArray(context?.prescriptionMedicines)
+    ? context?.prescriptionMedicines.filter(Boolean).join(", ")
+    : "";
+  const systemPrompt =
+    ["You are a medical-order safety classifier for an Indian pharmacy assistant. Return ONLY compact JSON with keys: decision, medicineName, requiresPrescription, reason, confidence. decision must be allow or deny. If medicine is in prescription list, decision should be allow. If medicine usually requires a prescription and is not in prescription list, decision must be deny. If medicine is typically OTC (prescription-free), decision should be allow even if not in list.",
+    "if user say- order medicine , ya dawaiya mangado ask - क्या आप अपनी सूची की सभी दवाइयाँ ऑर्डर करना चाहते हैं या किसी विशेष दवा को ऑर्डर करना चाहते हैं?- if user say order all medicine or sari dawaiya mangado then place entire prectiption else order specific medicine  "].join(" ");
+
+  const userPrompt = `User text: ${prompt}\nRequested medicine: ${context?.medicineName || ""}\nPrescription list: ${listed || "(empty)"}`;
+
+  const body = {
+    model: resolved.llmModel,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+    ],
+    temperature: 0,
+  };
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "api-subscription-key": resolved.apiKey,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    throw new Error(await responseError("Sarvam pharmacy-guard", response));
+  }
+
+  const payload = (await response.json()) as Record<string, unknown>;
+  const text = extractLlmText(payload);
+  if (!text) {
+    return null;
+  }
+
+  const parsed = parseJsonObject(text);
+  if (!parsed) {
+    return null;
+  }
+
+  const decisionRaw = asText(parsed.decision).toLowerCase();
+  const decision: "allow" | "deny" = decisionRaw === "deny" ? "deny" : "allow";
+  const confRaw = Number(parsed.confidence);
+  const confidence = Number.isFinite(confRaw) ? Math.max(0, Math.min(1, confRaw)) : undefined;
+
+  return {
+    decision,
+    medicineName: asText(parsed.medicineName) || undefined,
+    requiresPrescription: Boolean(parsed.requiresPrescription),
+    reason: asText(parsed.reason) || undefined,
+    confidence,
+  };
 }
 
 function asText(value: unknown): string {

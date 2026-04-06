@@ -262,6 +262,124 @@ button:disabled {
   z-index: 70;
 }
 
+.floating-reminders {
+  position: fixed;
+  right: 50px;
+  top: 50px;
+  width: min(420px, calc(100vw - 28px));
+  background: rgba(5, 16, 34, 0.94);
+  border-radius: 14px;
+  border: 1px solid rgba(130, 163, 210, 0.4);
+  box-shadow: 0 20px 40px rgba(3, 11, 25, 0.48);
+  padding: 10px;
+  z-index: 70;
+  display: grid;
+  gap: 8px;
+}
+
+.reminder-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.reminder-header h3 {
+  margin: 0;
+  font-size: 0.95rem;
+  color: #e8f3ff;
+}
+
+.reminder-header span {
+  font-size: 0.74rem;
+  color: #b9d4f5;
+}
+
+.reminder-header-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.reminder-demo {
+  border-radius: 8px;
+  border: 1px solid rgba(80, 190, 220, 0.6);
+  background: rgba(23, 93, 140, 0.5);
+  color: #dff4ff;
+  padding: 6px 10px;
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+
+.reminder-list {
+  display: grid;
+  gap: 8px;
+  max-height: 42vh;
+  overflow: auto;
+}
+
+.reminder-card {
+  border-radius: 12px;
+  border: 1px solid rgba(122, 157, 207, 0.38);
+  background: rgba(13, 33, 60, 0.75);
+  padding: 8px;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.reminder-meta {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.reminder-meta strong {
+  font-size: 0.86rem;
+  color: #eef6ff;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.reminder-meta span {
+  font-size: 0.78rem;
+  color: #c6dcfa;
+}
+
+.reminder-meta small {
+  font-size: 0.72rem;
+  color: #a9c3e6;
+}
+
+.reminder-delete {
+  border-radius: 8px;
+  border: 1px solid rgba(231, 115, 142, 0.62);
+  background: rgba(130, 36, 58, 0.46);
+  color: #ffd9e3;
+  padding: 6px 10px;
+  font-size: 0.74rem;
+  white-space: nowrap;
+}
+
+.reminder-empty {
+  border-radius: 12px;
+  border: 1px dashed rgba(151, 180, 220, 0.4);
+  padding: 10px;
+  color: #a9bfde;
+  font-size: 0.86rem;
+}
+
+.reminder-state {
+  margin: 0;
+  font-size: 0.74rem;
+  color: #c6dcfa;
+}
+
+.reminder-state.error {
+  color: #ffadbc;
+}
+
 .health-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -424,6 +542,13 @@ button:disabled {
   }
 
   .floating-health {
+    width: min(92vw, 380px);
+  }
+
+  .floating-reminders {
+    right: 4vw;
+    top: auto;
+    bottom: 18px;
     width: min(92vw, 380px);
   }
 

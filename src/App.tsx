@@ -7,6 +7,7 @@ import { DEFAULT_GREETING_MESSAGE, DEFAULT_SESSION_INSTRUCTIONS } from "./config
 import {
   composeOrderConfirmationMessageSarvam,
   inferConfirmationDecisionSarvam,
+  inferPharmacyOrderGuardSarvam,
   inferSahaaraIntentSarvam,
   isSarvamConfigured,
   llmReplyMock,
@@ -16,8 +17,13 @@ import {
   type SahaaraIntentPlan,
 } from "./services/sarvamClient";
 import {
+  acknowledgeMedicineReminder,
   confirmPreparedOrder,
+  createMedicineReminder,
+  deleteMedicineReminder,
   getSahaaraHealth,
+  listMedicineReminders,
+  type MedicineReminder,
   getWatchLatest,
   getWatchUserId,
   prepareDoctorAppointment,
@@ -48,6 +54,12 @@ interface WatchPanelSnapshot {
 interface ActionReply {
   reply: string;
   pendingOrder?: PreparedAssistantOrder;
+}
+
+interface ParsedReminderIntent {
+  medicineName: string;
+  dose: string;
+  time24?: string;
 }
 
 const STORAGE_KEY = "sahaara.ai.chatHistory.v2";
@@ -92,6 +104,11 @@ function App() {
   const [pendingOrder, setPendingOrder] = useState<PreparedAssistantOrder | null>(null);
   const [assistantLanguageMode, setAssistantLanguageMode] = useState<AssistantLanguageMode>("mix");
   const [wakeWordEveryUtterance, setWakeWordEveryUtterance] = useState(true);
+  const [showReminderPanel, setShowReminderPanel] = useState(false);
+  const [reminders, setReminders] = useState<MedicineReminder[]>([]);
+  const [reminderLoading, setReminderLoading] = useState(false);
+  const [reminderError, setReminderError] = useState("");
+  const reminderInFlightRef = useRef<Set<string>>(new Set());
 
   const supportsRecording =
     typeof window !== "undefined" &&
@@ -156,6 +173,20 @@ function App() {
     }
   }, []);
 
+  const loadReminders = useCallback(async () => {
+    setReminderLoading(true);
+    setReminderError("");
+    try {
+      const userId = getWatchUserId();
+      const list = await listMedicineReminders(userId);
+      setReminders(list);
+    } catch (error) {
+      setReminderError(toErrorMessage(error));
+    } finally {
+      setReminderLoading(false);
+    }
+  }, []);
+
   const stopAiTranscriptAnimation = useCallback(() => {
     if (aiTranscriptTimerRef.current !== null) {
       window.clearInterval(aiTranscriptTimerRef.current);
@@ -195,8 +226,8 @@ function App() {
   );
 
   const speakReply = useCallback(
-    async (text: string) => {
-      if (isChatOnly) return;
+    async (text: string, forceSpeak = false) => {
+      if (isChatOnly && !forceSpeak) return;
       setIsSpeaking(true);
       animateAiTranscript(text);
 
@@ -237,6 +268,23 @@ function App() {
     },
     [animateAiTranscript, isChatOnly]
   );
+
+  const runReminderDemo = useCallback(() => {
+    const sample = reminders[0];
+    const reminderText = sample
+      ? ` ${sample.medicineName} (${sample.dose}) का समय हो गया है। कृपया दवा ले लीजिए।`
+      : " मेडिसिन का समय हो गया है। कृपया मेडिसिन ले लीजिए।";
+
+    appendMessage({
+      id: crypto.randomUUID(),
+      role: "assistant",
+      text: reminderText,
+      timestamp: Date.now(),
+      mode: "chat",
+    });
+    setStatus("Medicine reminder demo");
+    void speakReply(reminderText, true);
+  }, [appendMessage, reminders, speakReply]);
 
   useEffect(() => {
     if (hasSpokenGreetingRef.current) return;
@@ -292,6 +340,29 @@ function App() {
             nextLanguageMode === "english"
               ? "Sure. I will reply in English from now on."
               : "Theek hai. Ab se main Hindi + English mix mein reply karungi.";
+        } else if (isReminderIntentMessage(normalized)) {
+          const reminderIntent = parseMedicineReminderIntent(normalized);
+          if (!reminderIntent?.time24) {
+            reply = chooseReply(
+              nextLanguageMode,
+              "Medicine reminder set karne ke liye time bhi boliye. Example: paracetamol at 09:30 PM.",
+              "Please share the time too. Example: paracetamol at 09:30 PM."
+            );
+          } else {
+            const created = await createMedicineReminder({
+              userId: getWatchUserId(),
+              medicineName: reminderIntent.medicineName,
+              dose: reminderIntent.dose,
+              time24: reminderIntent.time24,
+            });
+            setShowReminderPanel(true);
+            await loadReminders();
+            reply = chooseReply(
+              nextLanguageMode,
+              `Reminder set ho gaya: ${created.medicineName} (${created.dose}) at ${toDisplayTime(created.time24)}.`,
+              `Reminder set: ${created.medicineName} (${created.dose}) at ${toDisplayTime(created.time24)}.`
+            );
+          }
         } else {
           const confirmationDecision = pendingOrder
           ? await inferConfirmationDecision(normalized, pendingOrder)
@@ -333,7 +404,7 @@ function App() {
               `I did not clearly catch that. Please reply "confirm" to place ${pendingOrder.itemName}, or "cancel" to stop.`
             );
           } else {
-            const actionReply = await tryHandleSahaaraAction(normalized, nextLanguageMode);
+            const actionReply = await tryHandleSahaaraAction(normalized, nextLanguageMode, reminders);
             if (actionReply) {
               reply = actionReply.reply;
               if (actionReply.pendingOrder) {
@@ -381,7 +452,7 @@ function App() {
         await speakReply(reply);
       }
     },
-    [appendMessage, assistantLanguageMode, isChatOnly, pendingOrder, speakReply]
+    [appendMessage, assistantLanguageMode, isChatOnly, loadReminders, pendingOrder, reminders, speakReply]
   );
 
   const processVoiceBlob = useCallback(
@@ -629,6 +700,52 @@ function App() {
   ]);
 
   useEffect(() => {
+    void loadReminders();
+  }, [loadReminders]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      void loadReminders();
+    }, 45000);
+    return () => window.clearInterval(timer);
+  }, [loadReminders]);
+
+  useEffect(() => {
+    if (reminders.length === 0) return;
+    const due = reminders.filter((item) => {
+      const triggerAt = Date.parse(item.nextTriggerAt || "");
+      return Number.isFinite(triggerAt) && triggerAt <= Date.now();
+    });
+
+    if (due.length === 0) return;
+
+    due.forEach((item) => {
+      if (reminderInFlightRef.current.has(item.id)) return;
+      reminderInFlightRef.current.add(item.id);
+      void (async () => {
+        const reminderText = `Reminder: ${item.medicineName} (${item.dose}) ka time ho gaya hai.`;
+        appendMessage({
+          id: crypto.randomUUID(),
+          role: "assistant",
+          text: reminderText,
+          timestamp: Date.now(),
+          mode: "chat",
+        });
+        setStatus("Medicine reminder");
+        if (!isChatOnly) {
+          await speakReply(reminderText);
+        }
+        try {
+          await acknowledgeMedicineReminder(item.id);
+          await loadReminders();
+        } finally {
+          reminderInFlightRef.current.delete(item.id);
+        }
+      })();
+    });
+  }, [appendMessage, isChatOnly, loadReminders, reminders, speakReply]);
+
+  useEffect(() => {
     return () => {
       stopSpeechRecognition();
       stopRecording(true);
@@ -775,6 +892,22 @@ function App() {
               </svg>
             </button>
             <button
+              className={`icon-btn ${showReminderPanel ? "success" : "secondary"}`}
+              onClick={() => {
+                const next = !showReminderPanel;
+                setShowReminderPanel(next);
+                if (next) {
+                  void loadReminders();
+                }
+              }}
+              title={showReminderPanel ? "Hide medicine schedule" : "Show medicine schedule"}
+              aria-label={showReminderPanel ? "Hide medicine schedule" : "Show medicine schedule"}
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M7 4a3 3 0 0 1 3-3h4a3 3 0 1 1 0 6h-1v2.59l4.7 4.7a3 3 0 0 1 0 4.24l-1.17 1.17a3 3 0 0 1-4.24 0l-4.7-4.7H6a3 3 0 1 1 0-6h1V7H6a3 3 0 0 1 0-6h1zm3-1a1 1 0 0 0 0 2h4a1 1 0 1 0 0-2h-4z" />
+              </svg>
+            </button>
+            <button
               className={`icon-btn ${showHealthPanel ? "success" : "secondary"}`}
               onClick={() => setShowHealthPanel((prev) => !prev)}
               title={showHealthPanel ? "Hide health" : "Show health"}
@@ -874,6 +1007,50 @@ function App() {
         </section>
       )}
 
+      {showReminderPanel && (
+        <section className="floating-reminders" aria-label="Medicine schedule panel">
+          <div className="reminder-header">
+            <h3>Medicine Schedule</h3>
+            <div className="reminder-header-actions">
+              <span>{reminders.length} item(s)</span>
+              <button className="reminder-demo" onClick={runReminderDemo} aria-label="Run reminder demo">
+                Demo Reminder
+              </button>
+            </div>
+          </div>
+
+          <div className="reminder-list">
+            {reminders.length === 0 && !reminderLoading && <p className="reminder-empty">No reminders yet.</p>}
+            {reminders.map((item) => (
+              <article key={item.id} className="reminder-card">
+                <div className="reminder-meta">
+                  <strong>{item.medicineName}</strong>
+                  <span>
+                    {item.dose} • {toDisplayTime(item.time24)}
+                  </span>
+                  <small>Next: {formatDateTime(item.nextTriggerAt)}</small>
+                </div>
+                <button
+                  className="reminder-delete"
+                  onClick={() => {
+                    void (async () => {
+                      await deleteMedicineReminder(item.id);
+                      await loadReminders();
+                    })();
+                  }}
+                  aria-label="Delete reminder"
+                >
+                  Remove
+                </button>
+              </article>
+            ))}
+          </div>
+
+          {reminderLoading && <p className="reminder-state">Loading...</p>}
+          {reminderError && <p className="reminder-state error">{reminderError}</p>}
+        </section>
+      )}
+
       {!isChatOnly && (
         <section className="floating-conversation" aria-label="Live conversation">
           <div className="floating-conversation-stream">
@@ -892,13 +1069,17 @@ function App() {
   );
 }
 
-async function tryHandleSahaaraAction(text: string, languageMode: AssistantLanguageMode): Promise<ActionReply | null> {
+async function tryHandleSahaaraAction(
+  text: string,
+  languageMode: AssistantLanguageMode,
+  prescriptionReminders: MedicineReminder[] = [],
+): Promise<ActionReply | null> {
   const lower = text.toLowerCase();
   const userId = getWatchUserId();
 
   const llmPlan = await inferActionPlan(text);
   if (llmPlan) {
-    const planned = await handleActionPlan(llmPlan, text, userId, languageMode);
+    const planned = await handleActionPlan(llmPlan, text, userId, languageMode, prescriptionReminders);
     if (planned) {
       return planned;
     }
@@ -915,6 +1096,7 @@ async function tryHandleSahaaraAction(text: string, languageMode: AssistantLangu
     /\b(doctor|appointment|consult|physician|cardio|cardiologist|derma|dermatology|pediatric|neurology|pulmonology)\b/i.test(
       lower
     );
+  const prescriptionList = uniquePrescriptionMedicineNames(prescriptionReminders);
 
   if (/(api health|health status|backend status|server status)/i.test(lower)) {
     const health = await getSahaaraHealth();
@@ -957,10 +1139,49 @@ async function tryHandleSahaaraAction(text: string, languageMode: AssistantLangu
   }
 
   if (hasOrderVerb && medicineHint) {
+    const genericMedicineOrder = isGenericPharmacyOrderText(lower);
+    if (genericMedicineOrder) {
+      if (prescriptionList.length === 0) {
+        return {
+          reply: chooseReply(
+            languageMode,
+            "Prescription list nahi mila. Pehle medicine reminder/prescription add kariye.",
+            "I could not find your prescription list. Please add medicine reminders first."
+          ),
+        };
+      }
+
+      const allMedicineOrder = await preparePharmacyOrder({
+        userId,
+        medicineName: prescriptionList.join(", "),
+        quantity: 1,
+        unit: "pack",
+      });
+      return {
+        reply: await buildConfirmationPrompt(languageMode, allMedicineOrder),
+        pendingOrder: allMedicineOrder,
+      };
+    }
+
     const medicineRaw =
-      pickItem(text, ["paracetamol", "dolo", "crocin", "calpol", "azithromycin", "vitamin c", "cetirizine"]) ||
-      "paracetamol";
-    const medicine = normalizeMedicineItem(medicineRaw);
+      extractRequestedMedicineText(text) ||
+      pickItem(text, ["paracetamol", "dolo", "crocin", "calpol", "azithromycin", "vitamin c", "cetirizine"]);
+    const medicine = normalizeMedicineItem(medicineRaw || "paracetamol");
+    const inPrescription = prescriptionList.some(
+      (item) => normalizeMedicineLabel(item) === normalizeMedicineLabel(medicine),
+    );
+    if (!inPrescription) {
+      const guard = await inferPharmacyGuard(text, medicine, prescriptionList);
+      if (guard.decision === "deny") {
+        return {
+          reply: chooseReply(
+            languageMode,
+            `Yeh medicine prescription wali lag rahi hai aur aapki prescription list mein nahi hai, isliye order place nahi kiya. ${guard.reason ? `Reason: ${guard.reason}` : ""}`,
+            `This medicine appears to require a prescription and is not in your prescription list, so I did not place the order. ${guard.reason ? `Reason: ${guard.reason}` : ""}`
+          ).trim(),
+        };
+      }
+    }
     const quantity = pickQuantity(lower) ?? 1;
     const order = await preparePharmacyOrder({
       userId,
@@ -1036,6 +1257,7 @@ async function handleActionPlan(
   text: string,
   userId: string,
   languageMode: AssistantLanguageMode,
+  prescriptionReminders: MedicineReminder[] = [],
 ): Promise<ActionReply | null> {
   if (plan.action === "none") {
     return null;
@@ -1083,11 +1305,55 @@ async function handleActionPlan(
   }
 
   if (plan.action === "pharmacy_order") {
+    const prescriptionList = uniquePrescriptionMedicineNames(prescriptionReminders);
+    const genericMedicineOrder = isGenericPharmacyOrderText(text.toLowerCase()) && !plan.medicineName;
+
+    if (genericMedicineOrder) {
+      if (prescriptionList.length === 0) {
+        return {
+          reply: chooseReply(
+            languageMode,
+            "Prescription list nahi mila. Pehle medicine reminder/prescription add kariye.",
+            "I could not find your prescription list. Please add medicine reminders first."
+          ),
+        };
+      }
+
+      const allMedicineOrder = await preparePharmacyOrder({
+        userId,
+        medicineName: prescriptionList.join(", "),
+        quantity: 1,
+        unit: "pack",
+      });
+      return {
+        reply: await buildConfirmationPrompt(languageMode, allMedicineOrder),
+        pendingOrder: allMedicineOrder,
+      };
+    }
+
     const medicineRaw =
       plan.medicineName ||
+      extractRequestedMedicineText(text) ||
       pickItem(text, ["paracetamol", "dolo", "crocin", "calpol", "azithromycin", "vitamin c", "cetirizine"]) ||
       "paracetamol";
     const medicine = normalizeMedicineItem(medicineRaw);
+
+    const inPrescription = prescriptionList.some(
+      (item) => normalizeMedicineLabel(item) === normalizeMedicineLabel(medicine),
+    );
+    if (!inPrescription) {
+      const guard = await inferPharmacyGuard(text, medicine, prescriptionList);
+      if (guard.decision === "deny") {
+        return {
+          reply: chooseReply(
+            languageMode,
+            `Yeh medicine prescription wali lag rahi hai aur aapki prescription list mein nahi hai, isliye order place nahi kiya. ${guard.reason ? `Reason: ${guard.reason}` : ""}`,
+            `This medicine appears to require a prescription and is not in your prescription list, so I did not place the order. ${guard.reason ? `Reason: ${guard.reason}` : ""}`
+          ).trim(),
+        };
+      }
+    }
+
     const quantity = plan.quantity ?? pickQuantity(text.toLowerCase()) ?? 1;
     const order = await preparePharmacyOrder({
       userId,
@@ -1149,6 +1415,75 @@ function resolveAssistantLanguageMode(text: string, current: AssistantLanguageMo
 
 function isLanguagePreferenceCommand(text: string): boolean {
   return /(speak|talk|reply|respond).*(english|hindi|hinglish|mix)|\b(only english|in english|hindi me|hindi mein)\b/i.test(text);
+}
+
+function isReminderIntentMessage(text: string): boolean {
+  return /\b(remind|reminder|medicine reminder|tablet reminder|dawai|dawa)\b/i.test(text);
+}
+
+function parseMedicineReminderIntent(text: string): ParsedReminderIntent | null {
+  const cleaned = String(text || "").trim();
+  if (!cleaned) return null;
+  if (!isReminderIntentMessage(cleaned)) return null;
+
+  const timeMatch = cleaned.match(/\b(?:at|@)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i);
+  const time24 = timeMatch ? parseTimeTo24(timeMatch[1], timeMatch[2], timeMatch[3]) : undefined;
+
+  const doseMatch = cleaned.match(/(\d+\s*(?:tablet|tab|capsule|cap|ml|spoon|drop|puff)s?)/i);
+  const dose = doseMatch?.[1]?.trim() || "1 tablet";
+
+  let medicine = cleaned
+    .replace(/\b(set|add|create|please|a|an|my|medicine|medicines|reminder|remind me|remind|to take|for|daily|everyday)\b/gi, " ")
+    .replace(/\b(?:at|@)\s*\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!medicine) medicine = "Medicine";
+  return {
+    medicineName: medicine,
+    dose,
+    time24,
+  };
+}
+
+function parseTimeTo24(hoursText: string, minutesText?: string, meridiemText?: string): string | undefined {
+  let hours = Number(hoursText);
+  let minutes = Number(minutesText || "0");
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return undefined;
+  if (minutes < 0 || minutes > 59) return undefined;
+
+  const meridiem = String(meridiemText || "").toLowerCase();
+  if (meridiem === "am" || meridiem === "pm") {
+    if (hours < 1 || hours > 12) return undefined;
+    if (meridiem === "am") {
+      if (hours === 12) hours = 0;
+    } else if (hours < 12) {
+      hours += 12;
+    }
+  } else if (hours < 0 || hours > 23) {
+    return undefined;
+  }
+
+  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
+}
+
+function toDisplayTime(time24: string): string {
+  const match = String(time24 || "").match(/^([01]\d|2[0-3]):([0-5]\d)$/);
+  if (!match) return time24;
+  const date = new Date();
+  date.setHours(Number(match[1]), Number(match[2]), 0, 0);
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function formatDateTime(isoText: string): string {
+  const parsed = Date.parse(isoText || "");
+  if (!Number.isFinite(parsed)) return "--";
+  return new Date(parsed).toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 function extractWakeWordCommand(text: string): string | null {
@@ -1244,6 +1579,83 @@ function normalizeMedicineItem(raw: string): string {
   const normalized = normalizeByCatalog(raw, MEDICINE_CANONICAL);
   if (normalized === "paracetamol") return "paracetamol";
   return normalized;
+}
+
+function normalizeMedicineLabel(value: string): string {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function uniquePrescriptionMedicineNames(reminders: MedicineReminder[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const item of reminders) {
+    const name = String(item.medicineName || "").trim();
+    if (!name) continue;
+    const key = normalizeMedicineLabel(name);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(name);
+  }
+  return out;
+}
+
+function isGenericPharmacyOrderText(text: string): boolean {
+  const lower = String(text || "").toLowerCase();
+  if (!/\b(order|buy|get|place)\b/.test(lower)) return false;
+  return /\b(medicine|medicines|dawai|dawa|prescription)\b/.test(lower) && !/\bfor\b/.test(lower);
+}
+
+function extractRequestedMedicineText(text: string): string | null {
+  const source = String(text || "");
+  const match = source.match(/(?:order|buy|get|place)\s+(?:medicine\s+)?(?:for\s+)?([a-zA-Z0-9+\-\s]{2,80})/i);
+  if (!match?.[1]) return null;
+  const cleaned = match[1]
+    .replace(/\b(tablet|tablets|strip|strips|capsule|capsules|please|now)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return cleaned || null;
+}
+
+async function inferPharmacyGuard(
+  text: string,
+  medicineName: string,
+  prescriptionMedicines: string[],
+): Promise<{ decision: "allow" | "deny"; reason?: string }> {
+  if (isSarvamConfigured()) {
+    try {
+      const plan = await inferPharmacyOrderGuardSarvam(text, {
+        medicineName,
+        prescriptionMedicines,
+      });
+      if (plan?.decision === "allow" || plan?.decision === "deny") {
+        return {
+          decision: plan.decision,
+          reason: plan.reason,
+        };
+      }
+    } catch {
+      // fallback below
+    }
+  }
+
+  const otc = [
+    "paracetamol",
+    "cetirizine",
+    "vitamin c",
+    "vitamin c zinc",
+    "cough syrup",
+    "antacid",
+    "ors",
+  ];
+  const key = normalizeMedicineLabel(medicineName);
+  const allow = otc.some((item) => key.includes(normalizeMedicineLabel(item)));
+  return {
+    decision: allow ? "allow" : "deny",
+    reason: allow ? "OTC medicine" : "Prescription likely required",
+  };
 }
 
 function normalizeByCatalog(raw: string, catalog: readonly string[]): string {

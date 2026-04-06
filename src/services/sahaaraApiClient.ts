@@ -24,6 +24,40 @@ interface HealthData {
   };
 }
 
+export interface MedicineReminder {
+  id: string;
+  userId: string;
+  medicineName: string;
+  dose: string;
+  time24: string;
+  days: string[];
+  notes: string;
+  nextTriggerAt: string;
+  lastTriggeredAt?: string;
+  createdAt: string;
+}
+
+interface MedicineReminderRecord {
+  id?: unknown;
+  userId?: unknown;
+  medicineName?: unknown;
+  dose?: unknown;
+  time24?: unknown;
+  days?: unknown;
+  notes?: unknown;
+  nextTriggerAt?: unknown;
+  lastTriggeredAt?: unknown;
+  createdAt?: unknown;
+}
+
+interface MedicineReminderData {
+  reminder: MedicineReminderRecord;
+}
+
+interface MedicineReminderListData {
+  reminders: MedicineReminderRecord[];
+}
+
 export interface WatchLatestSnapshot {
   userId: string;
   snapshot: {
@@ -507,6 +541,72 @@ export async function queueAgentTask(input: QueueAgentTaskInput): Promise<AgentT
   });
 
   return payload.data.task;
+}
+
+function toMedicineReminder(record: MedicineReminderRecord): MedicineReminder {
+  const daysRaw = Array.isArray(record.days) ? record.days.filter((item) => typeof item === "string") : [];
+  return {
+    id: String(record.id || ""),
+    userId: String(record.userId || ""),
+    medicineName: String(record.medicineName || "medicine"),
+    dose: String(record.dose || "1 dose"),
+    time24: String(record.time24 || "09:00"),
+    days: daysRaw.map((item) => String(item).trim()).filter(Boolean),
+    notes: String(record.notes || ""),
+    nextTriggerAt: String(record.nextTriggerAt || new Date().toISOString()),
+    lastTriggeredAt: record.lastTriggeredAt ? String(record.lastTriggeredAt) : undefined,
+    createdAt: String(record.createdAt || new Date().toISOString()),
+  };
+}
+
+export async function createMedicineReminder(input: {
+  userId: string;
+  medicineName: string;
+  dose?: string;
+  time24: string;
+  notes?: string;
+  days?: string[];
+}): Promise<MedicineReminder> {
+  const payload = await request<MedicineReminderData>("/api/medicine-reminders", {
+    method: "POST",
+    body: JSON.stringify({
+      userId: input.userId,
+      medicineName: input.medicineName,
+      dose: input.dose || "1 dose",
+      time24: input.time24,
+      notes: input.notes || "",
+      days: input.days || [],
+    }),
+  });
+
+  return toMedicineReminder(payload.data.reminder || {});
+}
+
+export async function listMedicineReminders(userId: string): Promise<MedicineReminder[]> {
+  const payload = await request<MedicineReminderListData>(
+    `/api/medicine-reminders?userId=${encodeURIComponent(userId)}`,
+    {
+      method: "GET",
+    },
+  );
+
+  return Array.isArray(payload.data.reminders)
+    ? payload.data.reminders.map((item) => toMedicineReminder(item || {}))
+    : [];
+}
+
+export async function acknowledgeMedicineReminder(reminderId: string): Promise<MedicineReminder> {
+  const payload = await request<MedicineReminderData>(`/api/medicine-reminders/${encodeURIComponent(reminderId)}/ack`, {
+    method: "POST",
+  });
+
+  return toMedicineReminder(payload.data.reminder || {});
+}
+
+export async function deleteMedicineReminder(reminderId: string): Promise<void> {
+  await request<{}>(`/api/medicine-reminders/${encodeURIComponent(reminderId)}`, {
+    method: "DELETE",
+  });
 }
 
 export async function placeGroceryOrder(input: {
