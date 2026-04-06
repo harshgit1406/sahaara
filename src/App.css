@@ -201,8 +201,8 @@ button:disabled {
 
 .floating-conversation {
   position: fixed;
-  left: 14px;
-  bottom: 14px;
+  left: 100px;
+  bottom: 200px;
   width: min(370px, calc(100vw - 28px));
   background: rgba(5, 16, 34, 0.92);
   border-radius: 14px;
@@ -214,8 +214,8 @@ button:disabled {
 
 .floating-health {
   position: fixed;
-  left: 14px;
-  top: 14px;
+  left: 50px;
+  top: 50px;
   width: min(420px, calc(100vw - 28px));
   background: rgba(5, 16, 34, 0.94);
   border-radius: 14px;
