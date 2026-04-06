@@ -103,6 +103,7 @@ function App() {
   const [healthError, setHealthError] = useState("");
   const [watchSnapshot, setWatchSnapshot] = useState<WatchPanelSnapshot | null>(null);
   const [pendingOrder, setPendingOrder] = useState<PreparedAssistantOrder | null>(null);
+  const pendingOrderRef = useRef<PreparedAssistantOrder | null>(null);
   const [assistantLanguageMode, setAssistantLanguageMode] = useState<AssistantLanguageMode>("mix");
   const [wakeWordEveryUtterance, setWakeWordEveryUtterance] = useState(true);
   const [showReminderPanel, setShowReminderPanel] = useState(false);
@@ -132,6 +133,10 @@ function App() {
   useEffect(() => {
     micActiveRef.current = isMicOn && !isChatOnly;
   }, [isChatOnly, isMicOn]);
+
+  useEffect(() => {
+    pendingOrderRef.current = pendingOrder;
+  }, [pendingOrder]);
 
   useEffect(() => {
     try {
@@ -319,6 +324,7 @@ function App() {
       }
 
       const snapshot = messagesRef.current;
+      const activePendingOrder = pendingOrderRef.current;
 
       appendMessage({
         id: crypto.randomUUID(),
@@ -331,7 +337,7 @@ function App() {
       setIsThinking(true);
       setStatus("Thinking");
 
-      const shouldShowPlacingOrder = !pendingOrder && isOrderIntentMessage(normalized);
+      const shouldShowPlacingOrder = !activePendingOrder && isOrderIntentMessage(normalized);
       if (shouldShowPlacingOrder) {
         const placingOrderText = chooseReply(
           nextLanguageMode,
@@ -382,7 +388,7 @@ function App() {
             );
           }
         } else {
-          const directDecision = pendingOrder
+          const directDecision = activePendingOrder
             ? isConfirmReply(normalized)
               ? "confirm"
               : isCancelReply(normalized)
@@ -390,14 +396,15 @@ function App() {
                 : null
             : null;
 
-          const confirmationDecision = pendingOrder
-            ? directDecision || (await inferConfirmationDecision(normalized, pendingOrder))
+          const confirmationDecision = activePendingOrder
+            ? directDecision || (await inferConfirmationDecision(normalized, activePendingOrder))
             : "unclear";
 
-          if (pendingOrder && confirmationDecision === "confirm") {
+          if (activePendingOrder && confirmationDecision === "confirm") {
             setStatus("Confirming with API");
-            const confirmed = await confirmPreparedOrder(pendingOrder, true);
+            const confirmed = await confirmPreparedOrder(activePendingOrder, true);
             if (confirmed.status !== "confirmed") {
+              pendingOrderRef.current = null;
               setPendingOrder(null);
               reply = chooseReply(
                 nextLanguageMode,
@@ -405,10 +412,11 @@ function App() {
                 "Confirmation was not received or the request was cancelled. No order was placed."
               );
             } else if (confirmed.kind === "doctor") {
+              pendingOrderRef.current = null;
               setPendingOrder(null);
-              const doctorName = confirmed.doctorName || pendingOrder.itemName;
-              const fee = confirmed.fee ?? pendingOrder.unitPrice;
-              const visitMode = pendingOrder.doctorMode || "online";
+              const doctorName = confirmed.doctorName || activePendingOrder.itemName;
+              const fee = confirmed.fee ?? activePendingOrder.unitPrice;
+              const visitMode = activePendingOrder.doctorMode || "online";
               const slot = confirmed.slot || "Slot confirmation shared shortly";
               reply = chooseReply(
                 nextLanguageMode,
@@ -416,33 +424,36 @@ function App() {
                 `Confirmed. Doctor appointment booked. Doctor: ${doctorName}. Mode: ${visitMode}. Fee: Rs ${fee}. Slot: ${slot}.`
               );
             } else {
+              pendingOrderRef.current = null;
               setPendingOrder(null);
-              const itemName = confirmed.itemName || confirmed.medicineName || pendingOrder.itemName;
-              const quantity = pendingOrder.quantity;
-              const total = pendingOrder.totalPrice;
+              const itemName = confirmed.itemName || confirmed.medicineName || activePendingOrder.itemName;
+              const quantity = activePendingOrder.quantity;
+              const total = activePendingOrder.totalPrice;
               reply = chooseReply(
                 nextLanguageMode,
                 `Confirm ho gaya. Order place ho gaya for ${itemName}. Quantity: ${quantity}. Total: Rs ${total}. Estimated delivery: 30 to 40 minutes.`,
                 `Confirmed. Order placed for ${itemName}. Quantity: ${quantity}. Total: Rs ${total}. Estimated delivery: 30 to 40 minutes.`
               );
             }
-          } else if (pendingOrder && confirmationDecision === "cancel") {
-            await confirmPreparedOrder(pendingOrder, false);
+          } else if (activePendingOrder && confirmationDecision === "cancel") {
+            await confirmPreparedOrder(activePendingOrder, false);
+            pendingOrderRef.current = null;
             setPendingOrder(null);
             reply = chooseReply(nextLanguageMode, "Cancel kar diya. Order place nahi hua.", "Cancelled. No order was placed.");
-          } else if (pendingOrder && isOrderIntentMessage(normalized)) {
-            reply = await buildConfirmationPrompt(nextLanguageMode, pendingOrder, true);
-          } else if (pendingOrder && confirmationDecision === "unclear") {
+          } else if (activePendingOrder && isOrderIntentMessage(normalized)) {
+            reply = await buildConfirmationPrompt(nextLanguageMode, activePendingOrder, true);
+          } else if (activePendingOrder && confirmationDecision === "unclear") {
             reply = chooseReply(
               nextLanguageMode,
-              `Mujhe clearly samajh nahi aaya. ${pendingOrder.itemName} place karne ke liye "confirm" bolo, ya stop ke liye "cancel" bolo.`,
-              `I did not clearly catch that. Please reply "confirm" to place ${pendingOrder.itemName}, or "cancel" to stop.`
+              `Mujhe clearly samajh nahi aaya. ${activePendingOrder.itemName} place karne ke liye "confirm" bolo, ya stop ke liye "cancel" bolo.`,
+              `I did not clearly catch that. Please reply "confirm" to place ${activePendingOrder.itemName}, or "cancel" to stop.`
             );
           } else {
             const actionReply = await tryHandleSahaaraAction(normalized, nextLanguageMode, reminders);
             if (actionReply) {
               reply = actionReply.reply;
               if (actionReply.pendingOrder) {
+                pendingOrderRef.current = actionReply.pendingOrder;
                 setPendingOrder(actionReply.pendingOrder);
               }
             }
@@ -487,7 +498,7 @@ function App() {
         await speakReply(reply);
       }
     },
-    [appendMessage, assistantLanguageMode, isChatOnly, loadReminders, pendingOrder, reminders, speakReply]
+    [appendMessage, assistantLanguageMode, isChatOnly, loadReminders, reminders, speakReply]
   );
 
   const processVoiceBlob = useCallback(

@@ -187,8 +187,8 @@ export interface ConfirmedAssistantOrder {
 const env = import.meta.env as Env;
 const DEFAULT_BASE_URL = "https://sahaara-api.vercel.app";
 const DEFAULT_WATCH_USER_ID = "user123";
-const ORDER_CONFIRMATION_POLL_START_DELAY_MS = 5000;
-const ORDER_CONFIRMATION_POLL_INTERVAL_MS = 1500;
+const ORDER_CONFIRMATION_POLL_START_DELAY_MS = 1000;
+const ORDER_CONFIRMATION_POLL_INTERVAL_MS = 1000;
 
 function resolveBaseUrl() {
   return (env.VITE_SAHAARA_API_BASE_URL?.trim() || DEFAULT_BASE_URL).replace(/\/+$/, "");
@@ -311,7 +311,7 @@ async function queueUiDemoTask(
 async function waitForPendingConfirmationByType(
   type: "grocery" | "pharmacy" | "doctor",
   minCreatedAt: number,
-  timeoutMs = 12000,
+  timeoutMs = 15000,
 ): Promise<UiConfirmationRecord | null> {
   const started = Date.now();
   await sleep(ORDER_CONFIRMATION_POLL_START_DELAY_MS);
