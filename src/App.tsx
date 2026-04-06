@@ -59,6 +59,7 @@ const VOICE_AUDIO_CONSTRAINTS: MediaTrackConstraints = {
   noiseSuppression: true,
   autoGainControl: true,
 };
+const BROWSER_STT_LANG = (import.meta.env.VITE_SARVAM_STT_LANG || "hi-IN").trim();
 
 function App() {
   const avatarControlsRef = useRef<AvatarControls | null>(null);
@@ -518,7 +519,7 @@ function App() {
     recognitionRef.current = recognition;
     recognition.continuous = true;
     recognition.interimResults = true;
-    recognition.lang = "en-IN";
+    recognition.lang = BROWSER_STT_LANG || "hi-IN";
 
     recognition.onstart = () => {
       setIsRecording(true);

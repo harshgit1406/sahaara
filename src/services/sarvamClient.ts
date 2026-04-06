@@ -62,6 +62,9 @@ type Env = ImportMetaEnv & {
   readonly VITE_SARVAM_TTS_MODEL?: string;
   readonly VITE_SARVAM_TTS_SPEAKER?: string;
   readonly VITE_SARVAM_TTS_LANG?: string;
+  readonly VITE_SARVAM_STT_LANG?: string;
+  readonly VITE_SARVAM_STT_MODE?: string;
+  readonly VITE_SARVAM_STT_MODEL?: string;
 };
 
 const env = import.meta.env as Env;
@@ -84,6 +87,9 @@ function getSarvamConfig(overrides?: SarvamConfig) {
     ttsModel: env.VITE_SARVAM_TTS_MODEL?.trim() || "bulbul:v3",
     ttsSpeaker: env.VITE_SARVAM_TTS_SPEAKER?.trim() || "Ritu",
     ttsLang: env.VITE_SARVAM_TTS_LANG?.trim() || "en-IN",
+    sttLang: env.VITE_SARVAM_STT_LANG?.trim() || "hi-IN",
+    sttMode: env.VITE_SARVAM_STT_MODE?.trim() || "codemix",
+    sttModel: env.VITE_SARVAM_STT_MODEL?.trim() || "saaras:v3",
   };
 }
 
@@ -444,6 +450,9 @@ export async function sttSarvam(audio: Blob, config?: SarvamConfig): Promise<str
   const endpoint = toAbsoluteUrl(resolved.baseUrl, resolved.sttEndpoint);
   const formData = new FormData();
   formData.append("file", audio, "speech.webm");
+  formData.append("language_code", resolved.sttLang);
+  formData.append("mode", resolved.sttMode);
+  formData.append("model", resolved.sttModel);
 
   const response = await fetch(endpoint, {
     method: "POST",
