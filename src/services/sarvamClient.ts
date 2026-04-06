@@ -8,6 +8,25 @@ interface ChatMessage {
   mode: "voice" | "chat";
 }
 
+export type SahaaraIntentAction = "none" | "grocery_order" | "pharmacy_order" | "doctor_booking" | "watch_vitals" | "api_health";
+
+export interface SahaaraIntentPlan {
+  action: SahaaraIntentAction;
+  itemName?: string;
+  medicineName?: string;
+  quantity?: number;
+  doctorSpecialization?: string;
+  doctorMode?: "online" | "home";
+  confidence?: number;
+}
+
+type LlmRole = "system" | "user" | "assistant";
+
+interface LlmMessage {
+  role: LlmRole;
+  content: string;
+}
+
 export interface SarvamConfig {
   apiKey?: string;
   baseUrl?: string;
@@ -95,6 +114,90 @@ export async function llmReplySarvam(prompt: string, history: ChatMessage[], con
   }
 
   return text;
+}
+
+export async function inferSahaaraIntentSarvam(
+  prompt: string,
+  history: ChatMessage[] = [],
+  config?: SarvamConfig,
+): Promise<SahaaraIntentPlan | null> {
+  const resolved = getSarvamConfig(config);
+  ensureApiKey(resolved.apiKey);
+
+  const endpoint = toAbsoluteUrl(resolved.baseUrl, resolved.llmEndpoint);
+  const systemPrompt =
+    "You are an intent parser for a Hindi-first voice assistant. Correct ASR mistakes, Hinglish spellings, and transliterated Hindi. Return ONLY one valid compact JSON object with keys: action, itemName, medicineName, quantity, doctorSpecialization, doctorMode, confidence. action must be one of: none,grocery_order,pharmacy_order,doctor_booking,watch_vitals,api_health. quantity must be integer >=1 when present. doctorMode must be online or home when present.";
+
+  const historyMessages: LlmMessage[] = history
+    .slice(-6)
+    .map((item): LlmMessage => ({ role: item.role as LlmRole, content: item.text }));
+  const messages: LlmMessage[] = [
+    { role: "system", content: systemPrompt },
+    ...historyMessages,
+    { role: "user", content: prompt },
+  ];
+
+  const body = {
+    model: resolved.llmModel,
+    messages,
+    temperature: 0,
+  };
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "api-subscription-key": resolved.apiKey,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    throw new Error(await responseError("Sarvam intent", response));
+  }
+
+  const payload = (await response.json()) as Record<string, unknown>;
+  const text = extractLlmText(payload);
+  if (!text) {
+    return null;
+  }
+
+  const parsed = parseJsonObject(text);
+  if (!parsed) {
+    return null;
+  }
+
+  const rawAction = asText(parsed.action).toLowerCase();
+  const allowed: SahaaraIntentAction[] = [
+    "none",
+    "grocery_order",
+    "pharmacy_order",
+    "doctor_booking",
+    "watch_vitals",
+    "api_health",
+  ];
+  const action: SahaaraIntentAction = allowed.includes(rawAction as SahaaraIntentAction)
+    ? (rawAction as SahaaraIntentAction)
+    : "none";
+
+  const qRaw = Number(parsed.quantity);
+  const quantity = Number.isFinite(qRaw) && qRaw > 0 ? Math.round(qRaw) : undefined;
+
+  const modeRaw = asText(parsed.doctorMode).toLowerCase();
+  const doctorMode = modeRaw === "home" || modeRaw === "online" ? modeRaw : undefined;
+
+  const confRaw = Number(parsed.confidence);
+  const confidence = Number.isFinite(confRaw) ? Math.max(0, Math.min(1, confRaw)) : undefined;
+
+  return {
+    action,
+    itemName: asText(parsed.itemName) || undefined,
+    medicineName: asText(parsed.medicineName) || undefined,
+    quantity,
+    doctorSpecialization: asText(parsed.doctorSpecialization) || undefined,
+    doctorMode,
+    confidence,
+  };
 }
 
 export async function ttsSarvam(text: string, config?: SarvamConfig): Promise<ArrayBuffer> {
@@ -227,6 +330,23 @@ function extractSttText(payload: Record<string, unknown>): string {
 
 function asText(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function parseJsonObject(text: string): Record<string, unknown> | null {
+  const first = text.indexOf("{");
+  const last = text.lastIndexOf("}");
+  const candidate = first >= 0 && last > first ? text.slice(first, last + 1) : text;
+
+  try {
+    const parsed = JSON.parse(candidate) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
 }
 
 function decodeBase64ToArrayBuffer(base64: string): ArrayBuffer {

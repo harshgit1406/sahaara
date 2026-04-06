@@ -3,7 +3,15 @@ import "./App.css";
 import "./components/Avatar/avatar.css";
 import { Avatar } from "./components/Avatar";
 import type { AvatarControls } from "./components/Avatar";
-import { isSarvamConfigured, llmReplyMock, llmReplySarvam, sttSarvam, ttsSarvam } from "./services/sarvamClient";
+import {
+  inferSahaaraIntentSarvam,
+  isSarvamConfigured,
+  llmReplyMock,
+  llmReplySarvam,
+  sttSarvam,
+  ttsSarvam,
+  type SahaaraIntentPlan,
+} from "./services/sarvamClient";
 import {
   confirmPreparedOrder,
   getSahaaraHealth,
@@ -704,6 +712,15 @@ function App() {
 async function tryHandleSahaaraAction(text: string): Promise<ActionReply | null> {
   const lower = text.toLowerCase();
   const userId = getWatchUserId();
+
+  const llmPlan = await inferActionPlan(text);
+  if (llmPlan) {
+    const planned = await handleActionPlan(llmPlan, text, userId);
+    if (planned) {
+      return planned;
+    }
+  }
+
   const hasOrderVerb = /\b(order|book|place|get|buy|need|want|arrange|send)\b/i.test(lower);
   const groceryHint =
     /\b(grocery|groceries|ration|atta|rice|milk|bread|egg|eggs|banana|apple|dal|sugar|salt|flour)\b/i.test(lower);
@@ -769,6 +786,94 @@ async function tryHandleSahaaraAction(text: string): Promise<ActionReply | null>
   if (doctorHint && (hasOrderVerb || /\b(consult|appointment)\b/i.test(lower))) {
     const mode = /(home|at home)/i.test(lower) ? "home" : "online";
     const specialization = pickSpecialization(lower);
+    const appointmentTime = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
+    const appointment = await prepareDoctorAppointment({
+      userId,
+      doctorName: "Available Doctor",
+      specialization,
+      appointmentTime,
+      mode,
+    });
+    return {
+      reply: `Please confirm doctor booking: ${appointment.itemName}, mode ${appointment.doctorMode || mode}, fee Rs ${appointment.unitPrice}. Reply "confirm" to book or "cancel" to stop.`,
+      pendingOrder: appointment,
+    };
+  }
+
+  return null;
+}
+
+async function inferActionPlan(text: string): Promise<SahaaraIntentPlan | null> {
+  if (!isSarvamConfigured()) {
+    return null;
+  }
+
+  try {
+    return await inferSahaaraIntentSarvam(text);
+  } catch {
+    return null;
+  }
+}
+
+async function handleActionPlan(plan: SahaaraIntentPlan, text: string, userId: string): Promise<ActionReply | null> {
+  if (plan.action === "none") {
+    return null;
+  }
+
+  if (plan.action === "api_health") {
+    const health = await getSahaaraHealth();
+    return {
+      reply: health.firebase.initialized
+        ? "Sahaara API is connected and Firebase is initialized."
+        : "Sahaara API is reachable but Firebase is not initialized yet.",
+    };
+  }
+
+  if (plan.action === "watch_vitals") {
+    const watch = await getWatchLatest(userId);
+    const hr = watch.snapshot.heartRate != null ? `HR ${watch.snapshot.heartRate}` : "HR --";
+    const spo2 = watch.snapshot.spo2 != null ? `SpO2 ${watch.snapshot.spo2}` : "SpO2 --";
+    const temp = watch.snapshot.skinTemp != null ? `Temp ${watch.snapshot.skinTemp}` : "Temp --";
+    return { reply: `Latest watch vitals for ${watch.userId}: ${hr}, ${spo2}, ${temp}.` };
+  }
+
+  if (plan.action === "grocery_order") {
+    const item = plan.itemName || pickItem(text, ["rice", "milk", "bread", "egg", "eggs", "banana", "apple", "atta", "dal", "sugar", "salt"]) || "milk";
+    const quantity = plan.quantity ?? pickQuantity(text.toLowerCase()) ?? 1;
+    const order = await prepareGroceryOrder({
+      userId,
+      itemName: item,
+      quantity,
+      unit: "unit",
+      deliveryAddress: DEFAULT_ADDRESS,
+    });
+    return {
+      reply: `Please confirm grocery order: ${order.itemName}, qty ${order.quantity}, price Rs ${order.unitPrice} each (total Rs ${order.totalPrice}). Reply "confirm" to place or "cancel" to stop.`,
+      pendingOrder: order,
+    };
+  }
+
+  if (plan.action === "pharmacy_order") {
+    const medicine =
+      plan.medicineName ||
+      pickItem(text, ["paracetamol", "dolo", "crocin", "calpol", "azithromycin", "vitamin c", "cetirizine"]) ||
+      "paracetamol";
+    const quantity = plan.quantity ?? pickQuantity(text.toLowerCase()) ?? 1;
+    const order = await preparePharmacyOrder({
+      userId,
+      medicineName: medicine,
+      quantity,
+      unit: "strip",
+    });
+    return {
+      reply: `Please confirm pharmacy order: ${order.itemName}, qty ${order.quantity}, price Rs ${order.unitPrice} each (total Rs ${order.totalPrice}). Reply "confirm" to place or "cancel" to stop.`,
+      pendingOrder: order,
+    };
+  }
+
+  if (plan.action === "doctor_booking") {
+    const mode = plan.doctorMode || (/home|at home/i.test(text) ? "home" : "online");
+    const specialization = plan.doctorSpecialization || pickSpecialization(text.toLowerCase());
     const appointmentTime = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
     const appointment = await prepareDoctorAppointment({
       userId,
