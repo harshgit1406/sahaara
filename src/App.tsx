@@ -4,6 +4,7 @@ import "./components/Avatar/avatar.css";
 import { Avatar } from "./components/Avatar";
 import type { AvatarControls } from "./components/Avatar";
 import {
+  inferConfirmationDecisionSarvam,
   inferSahaaraIntentSarvam,
   isSarvamConfigured,
   llmReplyMock,
@@ -226,7 +227,11 @@ function App() {
       let reply = "";
 
       try {
-        if (pendingOrder && isConfirmReply(normalized)) {
+        const confirmationDecision = pendingOrder
+          ? await inferConfirmationDecision(normalized, pendingOrder)
+          : "unclear";
+
+        if (pendingOrder && confirmationDecision === "confirm") {
           const confirmed = await confirmPreparedOrder(pendingOrder, true);
           setPendingOrder(null);
           if (confirmed.kind === "doctor") {
@@ -241,12 +246,14 @@ function App() {
             const total = pendingOrder.totalPrice;
             reply = `Confirmed. Order placed for ${itemName}. Quantity: ${quantity}. Total: Rs ${total}. Estimated delivery: 30 to 40 minutes.`;
           }
-        } else if (pendingOrder && isCancelReply(normalized)) {
+        } else if (pendingOrder && confirmationDecision === "cancel") {
           await confirmPreparedOrder(pendingOrder, false);
           setPendingOrder(null);
           reply = "Cancelled. No order was placed.";
         } else if (pendingOrder && isOrderIntentMessage(normalized)) {
           reply = `Pending confirmation: ${pendingOrder.itemName}, qty ${pendingOrder.quantity}, price Rs ${pendingOrder.unitPrice} each (total Rs ${pendingOrder.totalPrice}). Reply "confirm" to place or "cancel" to stop.`;
+        } else if (pendingOrder && confirmationDecision === "unclear") {
+          reply = `I did not clearly catch that. Please reply "confirm" to place ${pendingOrder.itemName}, or "cancel" to stop.`;
         } else {
           const actionReply = await tryHandleSahaaraAction(normalized);
           if (actionReply) {
@@ -751,7 +758,8 @@ async function tryHandleSahaaraAction(text: string): Promise<ActionReply | null>
   }
 
   if (hasOrderVerb && groceryHint) {
-    const item = pickItem(text, ["rice", "milk", "bread", "egg", "eggs", "banana", "apple", "atta", "dal", "sugar", "salt"]) || "milk";
+    const itemRaw = pickItem(text, ["rice", "milk", "bread", "egg", "eggs", "banana", "apple", "atta", "dal", "sugar", "salt"]) || "milk";
+    const item = normalizeGroceryItem(itemRaw);
     const quantity = pickQuantity(lower) ?? 1;
     const order = await prepareGroceryOrder({
       userId,
@@ -767,9 +775,10 @@ async function tryHandleSahaaraAction(text: string): Promise<ActionReply | null>
   }
 
   if (hasOrderVerb && medicineHint) {
-    const medicine =
+    const medicineRaw =
       pickItem(text, ["paracetamol", "dolo", "crocin", "calpol", "azithromycin", "vitamin c", "cetirizine"]) ||
       "paracetamol";
+    const medicine = normalizeMedicineItem(medicineRaw);
     const quantity = pickQuantity(lower) ?? 1;
     const order = await preparePharmacyOrder({
       userId,
@@ -815,6 +824,31 @@ async function inferActionPlan(text: string): Promise<SahaaraIntentPlan | null> 
   }
 }
 
+async function inferConfirmationDecision(
+  text: string,
+  pendingOrder: PreparedAssistantOrder,
+): Promise<"confirm" | "cancel" | "unclear"> {
+  if (isSarvamConfigured()) {
+    try {
+      const plan = await inferConfirmationDecisionSarvam(text, {
+        kind: pendingOrder.kind,
+        itemName: pendingOrder.itemName,
+        quantity: pendingOrder.quantity,
+        totalPrice: pendingOrder.totalPrice,
+      });
+      if (plan?.decision) {
+        return plan.decision;
+      }
+    } catch {
+      // fallback to regex
+    }
+  }
+
+  if (isConfirmReply(text)) return "confirm";
+  if (isCancelReply(text)) return "cancel";
+  return "unclear";
+}
+
 async function handleActionPlan(plan: SahaaraIntentPlan, text: string, userId: string): Promise<ActionReply | null> {
   if (plan.action === "none") {
     return null;
@@ -838,7 +872,9 @@ async function handleActionPlan(plan: SahaaraIntentPlan, text: string, userId: s
   }
 
   if (plan.action === "grocery_order") {
-    const item = plan.itemName || pickItem(text, ["rice", "milk", "bread", "egg", "eggs", "banana", "apple", "atta", "dal", "sugar", "salt"]) || "milk";
+    const itemRaw =
+      plan.itemName || pickItem(text, ["rice", "milk", "bread", "egg", "eggs", "banana", "apple", "atta", "dal", "sugar", "salt"]) || "milk";
+    const item = normalizeGroceryItem(itemRaw);
     const quantity = plan.quantity ?? pickQuantity(text.toLowerCase()) ?? 1;
     const order = await prepareGroceryOrder({
       userId,
@@ -854,10 +890,11 @@ async function handleActionPlan(plan: SahaaraIntentPlan, text: string, userId: s
   }
 
   if (plan.action === "pharmacy_order") {
-    const medicine =
+    const medicineRaw =
       plan.medicineName ||
       pickItem(text, ["paracetamol", "dolo", "crocin", "calpol", "azithromycin", "vitamin c", "cetirizine"]) ||
       "paracetamol";
+    const medicine = normalizeMedicineItem(medicineRaw);
     const quantity = plan.quantity ?? pickQuantity(text.toLowerCase()) ?? 1;
     const order = await preparePharmacyOrder({
       userId,
@@ -901,6 +938,82 @@ function isCancelReply(text: string): boolean {
 
 function isOrderIntentMessage(text: string): boolean {
   return /\b(order|book|buy|get|medicine|grocery|doctor|appointment|atta|pharmacy)\b/i.test(text);
+}
+
+const GROCERY_CANONICAL = ["atta", "rice", "milk", "bread", "eggs", "banana", "apple", "dal", "sugar", "salt"] as const;
+const MEDICINE_CANONICAL = ["paracetamol", "cetirizine", "vitamin c", "azithromycin"] as const;
+
+function normalizeGroceryItem(raw: string): string {
+  return normalizeByCatalog(raw, GROCERY_CANONICAL);
+}
+
+function normalizeMedicineItem(raw: string): string {
+  const normalized = normalizeByCatalog(raw, MEDICINE_CANONICAL);
+  if (normalized === "paracetamol") return "paracetamol";
+  return normalized;
+}
+
+function normalizeByCatalog(raw: string, catalog: readonly string[]): string {
+  const cleaned = normalizeToken(raw);
+  if (!cleaned) return catalog[0] || raw;
+
+  const alias: Record<string, string> = {
+    aata: "atta",
+    ata: "atta",
+    gehun: "atta",
+    gehu: "atta",
+    doodh: "milk",
+    ande: "eggs",
+    anda: "eggs",
+    daal: "dal",
+    medisin: "paracetamol",
+    medicine: "paracetamol",
+    dolo: "paracetamol",
+    crocin: "paracetamol",
+    calpol: "paracetamol",
+    cetrizine: "cetirizine",
+    vitaminc: "vitamin c",
+  };
+
+  if (alias[cleaned]) return alias[cleaned];
+
+  let best = catalog[0] || raw;
+  let bestScore = Number.POSITIVE_INFINITY;
+  for (const candidate of catalog) {
+    const dist = levenshtein(cleaned, normalizeToken(candidate));
+    if (dist < bestScore) {
+      bestScore = dist;
+      best = candidate;
+    }
+  }
+
+  if (bestScore <= 3) return best;
+  return raw.trim();
+}
+
+function normalizeToken(value: string): string {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "")
+    .trim();
+}
+
+function levenshtein(a: string, b: string): number {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+
+  const dp = Array.from({ length: a.length + 1 }, () => new Array<number>(b.length + 1).fill(0));
+  for (let i = 0; i <= a.length; i += 1) dp[i][0] = i;
+  for (let j = 0; j <= b.length; j += 1) dp[0][j] = j;
+
+  for (let i = 1; i <= a.length; i += 1) {
+    for (let j = 1; j <= b.length; j += 1) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
+    }
+  }
+  return dp[a.length][b.length];
 }
 
 function pickQuantity(text: string): number | null {

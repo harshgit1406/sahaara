@@ -20,6 +20,13 @@ export interface SahaaraIntentPlan {
   confidence?: number;
 }
 
+export type ConfirmationDecision = "confirm" | "cancel" | "unclear";
+
+export interface ConfirmationPlan {
+  decision: ConfirmationDecision;
+  confidence?: number;
+}
+
 type LlmRole = "system" | "user" | "assistant";
 
 interface LlmMessage {
@@ -198,6 +205,70 @@ export async function inferSahaaraIntentSarvam(
     doctorMode,
     confidence,
   };
+}
+
+export async function inferConfirmationDecisionSarvam(
+  prompt: string,
+  context?: {
+    kind?: "grocery" | "pharmacy" | "doctor";
+    itemName?: string;
+    quantity?: number;
+    totalPrice?: number;
+  },
+  config?: SarvamConfig,
+): Promise<ConfirmationPlan | null> {
+  const resolved = getSarvamConfig(config);
+  ensureApiKey(resolved.apiKey);
+
+  const endpoint = toAbsoluteUrl(resolved.baseUrl, resolved.llmEndpoint);
+  const systemPrompt =
+    "You classify confirmation replies for an order assistant in Hindi, Hinglish, and English with ASR mistakes. Return ONLY compact JSON: {\"decision\":\"confirm|cancel|unclear\",\"confidence\":0..1}.";
+
+  const contextText = context
+    ? `Pending: kind=${context.kind || "unknown"}, item=${context.itemName || "unknown"}, qty=${context.quantity ?? "unknown"}, total=${context.totalPrice ?? "unknown"}`
+    : "Pending: unknown";
+
+  const messages: LlmMessage[] = [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: `${contextText}\nUser reply: ${prompt}` },
+  ];
+
+  const body = {
+    model: resolved.llmModel,
+    messages,
+    temperature: 0,
+  };
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "api-subscription-key": resolved.apiKey,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    throw new Error(await responseError("Sarvam confirmation", response));
+  }
+
+  const payload = (await response.json()) as Record<string, unknown>;
+  const text = extractLlmText(payload);
+  if (!text) return null;
+
+  const parsed = parseJsonObject(text);
+  if (!parsed) return null;
+
+  const rawDecision = asText(parsed.decision).toLowerCase();
+  const decision: ConfirmationDecision =
+    rawDecision === "confirm" || rawDecision === "cancel" || rawDecision === "unclear"
+      ? (rawDecision as ConfirmationDecision)
+      : "unclear";
+
+  const confRaw = Number(parsed.confidence);
+  const confidence = Number.isFinite(confRaw) ? Math.max(0, Math.min(1, confRaw)) : undefined;
+
+  return { decision, confidence };
 }
 
 export async function ttsSarvam(text: string, config?: SarvamConfig): Promise<ArrayBuffer> {
