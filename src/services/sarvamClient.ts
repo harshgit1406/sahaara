@@ -113,6 +113,7 @@ export async function llmReplySarvam(
   history: ChatMessage[],
   config?: SarvamConfig,
   mode: AssistantReplyMode = "mix",
+  sessionInstruction?: string,
 ): Promise<string> {
   const resolved = getSarvamConfig(config);
   ensureApiKey(resolved.apiKey);
@@ -121,16 +122,17 @@ export async function llmReplySarvam(
   const styleInstruction =
     mode === "english"
       ? "Reply in clear English only."
-      : "Reply in natural Hindi + English mix (Hinglish). Keep it concise and friendly.";
+      : "Reply in natural Hindi + English mix (Hinglish). Keep it concise and friendly.use very frndly and respectful tone. Avoid using words like 'karo'. Prefer respectful phrasing like 'kariye'.";
 
   const historyMessages: LlmMessage[] = history
     .slice(-10)
     .map((item): LlmMessage => ({ role: item.role as "user" | "assistant", content: item.text }));
-  const messages: LlmMessage[] = [
-    { role: "system", content: styleInstruction },
-    ...historyMessages,
-    { role: "user", content: prompt },
-  ];
+  const messages: LlmMessage[] = [{ role: "system", content: styleInstruction }];
+  const sessionText = String(sessionInstruction || "").trim();
+  if (sessionText) {
+    messages.push({ role: "system", content: sessionText });
+  }
+  messages.push(...historyMessages, { role: "user", content: prompt });
 
   const body = {
     model: resolved.llmModel,

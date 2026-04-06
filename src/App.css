@@ -109,6 +109,43 @@ button:disabled {
   box-shadow: 0 0 0 4px rgba(14, 203, 150, 0.28);
 }
 
+.icon-btn.danger {
+  box-shadow: 0 0 0 3px rgba(230, 73, 111, 0.28);
+}
+
+.mic-state-pill {
+  height: 34px;
+  min-width: 126px;
+  padding: 0 12px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(131, 165, 214, 0.44);
+  background: rgba(17, 34, 59, 0.92);
+  color: #d7e9ff;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+}
+
+.mic-state-pill.off {
+  border-color: rgba(141, 163, 194, 0.5);
+  background: rgba(35, 48, 70, 0.92);
+  color: #c0d0e8;
+}
+
+.mic-state-pill.on {
+  border-color: rgba(241, 96, 128, 0.68);
+  background: rgba(87, 22, 36, 0.95);
+  color: #ffe9ef;
+}
+
+.mic-state-pill.active {
+  box-shadow: 0 0 0 3px rgba(255, 124, 150, 0.22);
+}
+
 .chat-panel {
   display: flex;
   flex-direction: column;

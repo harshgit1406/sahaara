@@ -3,6 +3,7 @@ import "./App.css";
 import "./components/Avatar/avatar.css";
 import { Avatar } from "./components/Avatar";
 import type { AvatarControls } from "./components/Avatar";
+import { DEFAULT_GREETING_MESSAGE, DEFAULT_SESSION_INSTRUCTIONS } from "./config/assistantInstructions";
 import {
   composeOrderConfirmationMessageSarvam,
   inferConfirmationDecisionSarvam,
@@ -53,6 +54,11 @@ const STORAGE_KEY = "sahaara.ai.chatHistory.v2";
 const MAX_MESSAGES = 180;
 const TRANSCRIPT_WORDS_PREVIEW = 22;
 const DEFAULT_ADDRESS = "Saved user address";
+const VOICE_AUDIO_CONSTRAINTS: MediaTrackConstraints = {
+  echoCancellation: true,
+  noiseSuppression: true,
+  autoGainControl: true,
+};
 
 function App() {
   const avatarControlsRef = useRef<AvatarControls | null>(null);
@@ -64,8 +70,11 @@ function App() {
   const queueRef = useRef<Promise<void>>(Promise.resolve());
   const aiTranscriptTimerRef = useRef<number | null>(null);
   const messagesRef = useRef<ChatMessage[]>([]);
+  const sessionInstructionsRef = useRef(DEFAULT_SESSION_INSTRUCTIONS);
+  const hasSpokenGreetingRef = useRef(false);
+  const micActiveRef = useRef(false);
 
-  const [messages, setMessages] = useState<ChatMessage[]>(() => readHistory());
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [draft, setDraft] = useState("");
   const [isChatOnly, setIsChatOnly] = useState(false);
   const [isMicOn, setIsMicOn] = useState(false);
@@ -81,6 +90,7 @@ function App() {
   const [watchSnapshot, setWatchSnapshot] = useState<WatchPanelSnapshot | null>(null);
   const [pendingOrder, setPendingOrder] = useState<PreparedAssistantOrder | null>(null);
   const [assistantLanguageMode, setAssistantLanguageMode] = useState<AssistantLanguageMode>("mix");
+  const [wakeWordEveryUtterance, setWakeWordEveryUtterance] = useState(true);
 
   const supportsRecording =
     typeof window !== "undefined" &&
@@ -99,6 +109,32 @@ function App() {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(messages.slice(-MAX_MESSAGES)));
     } catch {}
   }, [messages]);
+
+  useEffect(() => {
+    micActiveRef.current = isMicOn && !isChatOnly;
+  }, [isChatOnly, isMicOn]);
+
+  useEffect(() => {
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+    } catch {}
+
+    const greeting = String(DEFAULT_GREETING_MESSAGE || "").trim();
+    if (!greeting) {
+      setMessages([]);
+      return;
+    }
+
+    setMessages([
+      {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        text: greeting,
+        timestamp: Date.now(),
+        mode: "chat",
+      },
+    ]);
+  }, []);
 
   const loadWatchSnapshot = useCallback(async () => {
     setHealthLoading(true);
@@ -171,7 +207,10 @@ function App() {
           setIsSpeaking(false);
           return;
         } catch (error) {
-          setStatus(`TTS fallback: ${toErrorMessage(error)}`);
+          setStatus(`Sarvam TTS failed: ${toErrorMessage(error)}`);
+          setIsSpeaking(false);
+          setLiveAiTranscript(text);
+          return;
         }
       }
 
@@ -197,6 +236,14 @@ function App() {
     },
     [animateAiTranscript, isChatOnly]
   );
+
+  useEffect(() => {
+    if (hasSpokenGreetingRef.current) return;
+    const greeting = String(DEFAULT_GREETING_MESSAGE || "").trim();
+    if (!greeting) return;
+    hasSpokenGreetingRef.current = true;
+    void speakReply(greeting);
+  }, [speakReply]);
 
   const submitUserMessage = useCallback(
     async (text: string, mode: InputMode) => {
@@ -301,7 +348,13 @@ function App() {
       if (!reply) {
         if (isSarvamConfigured()) {
           try {
-            reply = await llmReplySarvam(normalized, snapshot, undefined, nextLanguageMode);
+            reply = await llmReplySarvam(
+              normalized,
+              snapshot,
+              undefined,
+              nextLanguageMode,
+              sessionInstructionsRef.current
+            );
           } catch (error) {
             setStatus(`LLM fallback: ${toErrorMessage(error)}`);
             reply = await llmReplyMock(normalized, snapshot, nextLanguageMode);
@@ -332,7 +385,9 @@ function App() {
 
   const processVoiceBlob = useCallback(
     async (blob: Blob) => {
+      if (!micActiveRef.current) return;
       if (blob.size < 1200 || isChatOnly) return;
+      if (isSpeaking || window.speechSynthesis?.speaking) return;
 
       setStatus("Transcribing");
       setLiveUserTranscript("Listening...");
@@ -350,10 +405,18 @@ function App() {
 
       const clean = transcript.trim();
       if (!clean) return;
-      setLiveUserTranscript(clean);
-      await submitUserMessage(clean, "voice");
+      if (!micActiveRef.current) return;
+      const wakeDecision = gateVoiceTranscript(clean, wakeWordEveryUtterance);
+      if (!wakeDecision.acceptedText) {
+        setLiveUserTranscript(clean);
+        setStatus(wakeDecision.statusText);
+        return;
+      }
+      setLiveUserTranscript(wakeDecision.acceptedText);
+      if (!micActiveRef.current) return;
+      await submitUserMessage(wakeDecision.acceptedText, "voice");
     },
-    [isChatOnly, submitUserMessage]
+    [isChatOnly, isSpeaking, submitUserMessage, wakeWordEveryUtterance]
   );
 
   const stopRecording = useCallback(
@@ -370,6 +433,7 @@ function App() {
 
       mediaRecorderRef.current = null;
       chunksRef.current = [];
+      queueRef.current = Promise.resolve();
       setIsRecording(false);
 
       if (mediaStreamRef.current) {
@@ -397,7 +461,7 @@ function App() {
   const startRecording = useCallback(async () => {
     if (!supportsRecording || isChatOnly || !isSarvamConfigured()) return;
 
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: VOICE_AUDIO_CONSTRAINTS });
     mediaStreamRef.current = stream;
 
     const preferredType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
@@ -407,12 +471,17 @@ function App() {
     mediaRecorderRef.current = recorder;
 
     recorder.onstart = () => {
+      if (!micActiveRef.current) {
+        stopRecording(false);
+        return;
+      }
       setIsRecording(true);
       setStatus("Mic on");
       setLiveUserTranscript("Listening...");
     };
 
     recorder.ondataavailable = (event: BlobEvent) => {
+      if (!micActiveRef.current) return;
       if (event.data.size > 0) {
         chunksRef.current.push(event.data);
       }
@@ -458,13 +527,26 @@ function App() {
     };
 
     recognition.onresult = (event: SpeechRecognitionEvent) => {
+      if (!micActiveRef.current) return;
       let interim = "";
       for (let i = event.resultIndex; i < event.results.length; i += 1) {
         const transcript = event.results[i][0]?.transcript?.trim() ?? "";
         if (!transcript) continue;
         if (event.results[i].isFinal) {
-          setLiveUserTranscript(transcript);
-          void submitUserMessage(transcript, "voice");
+          if (isSpeaking || window.speechSynthesis?.speaking) {
+            continue;
+          }
+          const wakeDecision = gateVoiceTranscript(transcript, wakeWordEveryUtterance);
+          if (!wakeDecision.acceptedText) {
+            setLiveUserTranscript(transcript);
+            setStatus(wakeDecision.statusText);
+            continue;
+          }
+          setLiveUserTranscript(wakeDecision.acceptedText);
+          if (!micActiveRef.current) {
+            return;
+          }
+          void submitUserMessage(wakeDecision.acceptedText, "voice");
         } else {
           interim = `${interim} ${transcript}`.trim();
         }
@@ -478,13 +560,16 @@ function App() {
       setStatus("Speech recognition error");
       setIsRecording(false);
       stopSpeechRecognition();
+      if (!micActiveRef.current) {
+        return;
+      }
       if (isSarvamConfigured()) {
         void startRecording();
       }
     };
 
     recognition.onend = () => {
-      if (isMicOn && !isChatOnly) {
+      if (micActiveRef.current) {
         recognition.start();
       } else {
         setIsRecording(false);
@@ -492,7 +577,16 @@ function App() {
     };
 
     recognition.start();
-  }, [isChatOnly, isMicOn, startRecording, stopSpeechRecognition, submitUserMessage, supportsSpeechRecognition]);
+  }, [
+    isChatOnly,
+    isMicOn,
+    startRecording,
+    stopSpeechRecognition,
+    submitUserMessage,
+    supportsSpeechRecognition,
+    wakeWordEveryUtterance,
+    isSpeaking,
+  ]);
 
   useEffect(() => {
     if (isChatOnly && isMicOn) {
@@ -568,6 +662,7 @@ function App() {
     setLiveUserTranscript("");
     setLiveAiTranscript("");
     localStorage.removeItem(STORAGE_KEY);
+    sessionInstructionsRef.current = DEFAULT_SESSION_INSTRUCTIONS;
     setStatus("History cleared");
   }, []);
 
@@ -583,6 +678,21 @@ function App() {
       return next;
     });
   }, [stopAiVoice, stopRecording]);
+
+  const toggleMic = useCallback(() => {
+    setIsMicOn((prev) => {
+      const next = !prev;
+      if (!next) {
+        stopSpeechRecognition();
+        stopRecording(false);
+        setLiveUserTranscript("");
+        setStatus("Mic off");
+      } else {
+        setStatus("Mic on");
+      }
+      return next;
+    });
+  }, [stopRecording, stopSpeechRecognition]);
 
   const transcriptUser = liveUserTranscript || lastRoleText(messages, "user");
   const transcriptAi = liveAiTranscript || lastRoleText(messages, "assistant");
@@ -604,7 +714,7 @@ function App() {
           <div className="avatar-controls" role="toolbar" aria-label="Avatar controls">
             <button
               className={`icon-btn ${isMicOn ? "danger" : "success"} ${isRecording ? "listening" : ""}`}
-              onClick={() => setIsMicOn((prev) => !prev)}
+              onClick={toggleMic}
               disabled={isChatOnly || !supportsVoiceInput}
               title={isMicOn ? "Mic off" : "Mic on"}
               aria-label={isMicOn ? "Mic off" : "Mic on"}
@@ -612,6 +722,40 @@ function App() {
               <svg viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M12 15.5a3.5 3.5 0 0 0 3.5-3.5V7a3.5 3.5 0 0 0-7 0v5a3.5 3.5 0 0 0 3.5 3.5zm-6-3.5a1 1 0 1 1 2 0 4 4 0 0 0 8 0 1 1 0 1 1 2 0 5.98 5.98 0 0 1-5 5.91V20h2a1 1 0 1 1 0 2H9a1 1 0 1 1 0-2h2v-2.09A5.98 5.98 0 0 1 6 12z" />
               </svg>
+            </button>
+            <div
+              className={`mic-state-pill ${isMicOn ? "on" : "off"} ${isRecording ? "active" : ""}`}
+              aria-live="polite"
+            >
+              {isMicOn ? (isRecording ? "MIC ON - LISTENING" : "MIC ON") : "MIC OFF"}
+            </div>
+            <button
+              className={`icon-btn ${wakeWordEveryUtterance ? "success" : "secondary"}`}
+              onClick={() => {
+                setWakeWordEveryUtterance((prev) => !prev);
+                if (isMicOn && !isChatOnly) {
+                  stopSpeechRecognition();
+                  stopRecording(false);
+                  if (supportsSpeechRecognition) {
+                    void startSpeechRecognition().catch(() => undefined);
+                  } else {
+                    void startRecording().catch(() => undefined);
+                  }
+                }
+              }}
+              disabled={isChatOnly || !supportsVoiceInput}
+              title={
+                wakeWordEveryUtterance
+                  ? "Wake word required before every voice command"
+                  : "Wake word off (no Harshita required)"
+              }
+              aria-label={
+                wakeWordEveryUtterance
+                  ? "Wake word required before every voice command"
+                  : "Wake word off (no Harshita required)"
+              }
+            >
+              {wakeWordEveryUtterance ? "HW*" : "HW1"}
             </button>
             <button
               className="icon-btn secondary"
@@ -1006,6 +1150,47 @@ function isLanguagePreferenceCommand(text: string): boolean {
   return /(speak|talk|reply|respond).*(english|hindi|hinglish|mix)|\b(only english|in english|hindi me|hindi mein)\b/i.test(text);
 }
 
+function extractWakeWordCommand(text: string): string | null {
+  const raw = String(text || "").trim();
+  if (!raw) return null;
+  const match = raw.match(/^\s*harshita[\s,.:;!-]*(.+)$/i);
+  if (!match?.[1]) return null;
+  const command = match[1].trim();
+  return command || null;
+}
+
+function gateVoiceTranscript(
+  transcript: string,
+  requireEveryUtterance: boolean,
+): {
+  acceptedText: string | null;
+  unlockSession: boolean;
+  statusText: string;
+} {
+  const wakeCommand = extractWakeWordCommand(transcript);
+
+  if (requireEveryUtterance) {
+    if (!wakeCommand) {
+      return {
+        acceptedText: null,
+        unlockSession: false,
+        statusText: "Wake word not detected. Say 'Harshita ...'",
+      };
+    }
+    return {
+      acceptedText: wakeCommand,
+      unlockSession: false,
+      statusText: "Listening...",
+    };
+  }
+
+  return {
+    acceptedText: transcript.trim(),
+    unlockSession: false,
+    statusText: "Listening...",
+  };
+}
+
 async function buildConfirmationPrompt(
   languageMode: AssistantLanguageMode,
   order: PreparedAssistantOrder,
@@ -1154,18 +1339,6 @@ function pickSpecialization(text: string): string {
   if (/lung|breath|chest/.test(text)) return "Pulmonology";
   if (/neuro|brain|headache/.test(text)) return "Neurology";
   return "General Medicine";
-}
-
-function readHistory(): ChatMessage[] {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw) as ChatMessage[];
-    if (!Array.isArray(parsed)) return [];
-    return parsed.slice(-MAX_MESSAGES);
-  } catch {
-    return [];
-  }
 }
 
 function toPreview(text: string): string {
