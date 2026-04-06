@@ -204,6 +204,17 @@ function App() {
       setIsThinking(true);
       setStatus("Thinking");
 
+      const shouldShowPlacingOrder = !pendingOrder && isOrderIntentMessage(normalized);
+      if (shouldShowPlacingOrder) {
+        appendMessage({
+          id: crypto.randomUUID(),
+          role: "assistant",
+          text: "Placing order...",
+          timestamp: Date.now(),
+          mode: "chat",
+        });
+      }
+
       let reply = "";
 
       try {
@@ -211,14 +222,21 @@ function App() {
           const confirmed = await confirmPreparedOrder(pendingOrder, true);
           setPendingOrder(null);
           if (confirmed.kind === "doctor") {
-            reply = `Confirmed. Appointment booked with id ${confirmed.appointmentId || "N/A"}. Request id: ${confirmed.assistantRequestId}. Confirmation id: ${confirmed.confirmationId}.${confirmed.taskId ? ` Task id: ${confirmed.taskId}.` : ""}`;
+            const doctorName = confirmed.doctorName || pendingOrder.itemName;
+            const fee = confirmed.fee ?? pendingOrder.unitPrice;
+            const mode = pendingOrder.doctorMode || "online";
+            const slot = confirmed.slot || "Slot confirmation shared shortly";
+            reply = `Confirmed. Doctor appointment booked. Doctor: ${doctorName}. Mode: ${mode}. Fee: Rs ${fee}. Slot: ${slot}.`;
           } else {
-            reply = `Confirmed. Order placed with id ${confirmed.orderId || "N/A"}. Request id: ${confirmed.assistantRequestId}. Confirmation id: ${confirmed.confirmationId}.${confirmed.taskId ? ` Task id: ${confirmed.taskId}.` : ""}`;
+            const itemName = confirmed.itemName || confirmed.medicineName || pendingOrder.itemName;
+            const quantity = pendingOrder.quantity;
+            const total = pendingOrder.totalPrice;
+            reply = `Confirmed. Order placed for ${itemName}. Quantity: ${quantity}. Total: Rs ${total}. Estimated delivery: 30 to 40 minutes.`;
           }
         } else if (pendingOrder && isCancelReply(normalized)) {
-          const cancelled = await confirmPreparedOrder(pendingOrder, false);
+          await confirmPreparedOrder(pendingOrder, false);
           setPendingOrder(null);
-          reply = `Cancelled. No order was placed. Request id: ${cancelled.assistantRequestId}. Confirmation id: ${cancelled.confirmationId}.`;
+          reply = "Cancelled. No order was placed.";
         } else if (pendingOrder && isOrderIntentMessage(normalized)) {
           reply = `Pending confirmation: ${pendingOrder.itemName}, qty ${pendingOrder.quantity}, price Rs ${pendingOrder.unitPrice} each (total Rs ${pendingOrder.totalPrice}). Reply "confirm" to place or "cancel" to stop.`;
         } else {

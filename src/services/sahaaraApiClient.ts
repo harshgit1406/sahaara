@@ -134,6 +134,13 @@ export interface ConfirmedAssistantOrder {
   status: "confirmed" | "cancelled";
   orderId?: string;
   appointmentId?: string;
+  itemName?: string;
+  medicineName?: string;
+  doctorName?: string;
+  price?: number;
+  fee?: number;
+  eta?: string;
+  slot?: string;
 }
 
 const env = import.meta.env as Env;
@@ -306,6 +313,13 @@ export async function confirmPreparedOrder(prepared: PreparedAssistantOrder, con
     status,
     orderId: resolved.result?.orderId,
     appointmentId: resolved.result?.appointmentId,
+    itemName: resolved.result?.itemName,
+    medicineName: resolved.result?.medicineName,
+    doctorName: resolved.result?.doctorName,
+    price: resolved.result?.price,
+    fee: resolved.result?.fee,
+    eta: resolved.result?.eta,
+    slot: resolved.result?.slot,
   };
 }
 
