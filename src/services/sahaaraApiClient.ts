@@ -11,6 +11,11 @@ interface ApiEnvelope<T> {
   error?: unknown;
 }
 
+interface ApiErrorPayload {
+  message?: unknown;
+  error?: unknown;
+}
+
 interface HealthData {
   firebase: {
     initialized: boolean;
@@ -54,16 +59,49 @@ interface QueueAgentTaskData {
   task: AgentTaskRecord;
 }
 
-interface GroceryOrderData {
-  orderId: string;
+interface UiConfirmationResult {
+  status?: string;
+  orderId?: string;
+  appointmentId?: string;
+  itemName?: string;
+  medicineName?: string;
+  doctorName?: string;
+  slot?: string;
+  price?: number;
+  fee?: number;
+  eta?: string;
 }
 
-interface PharmacyOrderData {
-  orderId: string;
+interface UiConfirmationRecord {
+  id: string;
+  type: "grocery" | "pharmacy" | "doctor";
+  status: "pending" | "confirmed" | "cancelled";
+  message: string;
+  createdAt: number;
+  itemName?: string | null;
+  medicineName?: string | null;
+  doctorName?: string | null;
+  price?: number | null;
+  fee?: number | null;
+  slot?: string | null;
+  visitType?: "online" | "home" | null;
+  result: UiConfirmationResult | null;
 }
 
-interface AppointmentOrderData {
-  appointmentId: string;
+interface UiPendingConfirmationsResponse {
+  items: UiConfirmationRecord[];
+}
+
+interface UiRequestResponse {
+  confirmationId: string;
+  status: string;
+  itemName?: string;
+  medicineName?: string;
+  doctorName?: string;
+  price?: number;
+  fee?: number;
+  slot?: string;
+  message?: string;
 }
 
 export interface QueueAgentTaskInput {
@@ -71,6 +109,31 @@ export interface QueueAgentTaskInput {
   payload?: Record<string, unknown>;
   target?: string;
   createdBy?: string;
+}
+
+type AssistantOrderKind = "grocery" | "pharmacy" | "doctor";
+
+export interface PreparedAssistantOrder {
+  kind: AssistantOrderKind;
+  assistantRequestId: string;
+  taskId: string | null;
+  confirmationId: string;
+  quantity: number;
+  itemName: string;
+  unitPrice: number;
+  totalPrice: number;
+  message: string;
+  doctorMode?: "online" | "home";
+}
+
+export interface ConfirmedAssistantOrder {
+  kind: AssistantOrderKind;
+  assistantRequestId: string;
+  taskId: string | null;
+  confirmationId: string;
+  status: "confirmed" | "cancelled";
+  orderId?: string;
+  appointmentId?: string;
 }
 
 const env = import.meta.env as Env;
@@ -91,12 +154,7 @@ async function readError(response: Response): Promise<string> {
   const contentType = response.headers.get("content-type") ?? "";
 
   if (contentType.includes("application/json")) {
-    const payload = (await response.json().catch(() => null)) as
-      | {
-          message?: unknown;
-          error?: unknown;
-        }
-      | null;
+    const payload = (await response.json().catch(() => null)) as ApiErrorPayload | null;
 
     const maybeMessage = payload?.message;
     const maybeError = payload?.error;
@@ -130,6 +188,275 @@ async function request<T>(path: string, init?: RequestInit): Promise<ApiEnvelope
   }
 
   return (await response.json()) as ApiEnvelope<T>;
+}
+
+async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(toAbsoluteUrl(path), {
+    ...init,
+    headers: {
+      "Content-Type": "application/json",
+      ...(init?.headers ?? {}),
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(await readError(response));
+  }
+
+  return (await response.json()) as T;
+}
+
+function makeAssistantRequestId(kind: string): string {
+  const rand = Math.random().toString(36).slice(2, 10);
+  return `ai-${kind}-${Date.now()}-${rand}`;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
+
+async function listPendingConfirmations(): Promise<UiConfirmationRecord[]> {
+  const payload = await requestJson<UiPendingConfirmationsResponse>("/api/confirmations/pending", {
+    method: "GET",
+  });
+  return Array.isArray(payload.items) ? payload.items : [];
+}
+
+async function getConfirmation(confirmationId: string): Promise<UiConfirmationRecord> {
+  return requestJson<UiConfirmationRecord>(`/api/confirmations/${encodeURIComponent(confirmationId)}`, {
+    method: "GET",
+  });
+}
+
+async function resolveConfirmation(confirmationId: string, confirm: boolean): Promise<UiConfirmationRecord> {
+  return requestJson<UiConfirmationRecord>(`/api/confirmations/${encodeURIComponent(confirmationId)}/resolve`, {
+    method: "POST",
+    body: JSON.stringify({ confirm }),
+  });
+}
+
+async function queueUiDemoTask(
+  taskType: string,
+  payload: Record<string, unknown>,
+  assistantRequestId: string,
+): Promise<string | null> {
+  try {
+    const task = await queueAgentTask({
+      target: "ui-demo",
+      taskType,
+      payload: {
+        ...payload,
+        assistantRequestId,
+      },
+      createdBy: `ai-assistant:${assistantRequestId}`,
+    });
+    return task.id;
+  } catch {
+    return null;
+  }
+}
+
+async function waitForPendingConfirmationByType(
+  type: "grocery" | "pharmacy" | "doctor",
+  minCreatedAt: number,
+  timeoutMs = 12000,
+): Promise<UiConfirmationRecord | null> {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const pending = await listPendingConfirmations();
+    const match = pending.find((item) => item.type === type && Number(item.createdAt || 0) >= minCreatedAt - 5000);
+    if (match) {
+      return match;
+    }
+    await sleep(900);
+  }
+  return null;
+}
+
+async function ensurePendingConfirmation(
+  type: "grocery" | "pharmacy" | "doctor",
+  createRequest: () => Promise<UiRequestResponse>,
+  minCreatedAt: number,
+): Promise<UiConfirmationRecord> {
+  let confirmationId: string;
+  const pending = await waitForPendingConfirmationByType(type, minCreatedAt);
+
+  if (pending?.id) {
+    confirmationId = pending.id;
+  } else {
+    const created = await createRequest();
+    confirmationId = created.confirmationId;
+  }
+
+  const existing = await getConfirmation(confirmationId);
+  return existing;
+}
+
+export async function confirmPreparedOrder(prepared: PreparedAssistantOrder, confirm: boolean): Promise<ConfirmedAssistantOrder> {
+  const resolved = await resolveConfirmation(prepared.confirmationId, confirm);
+  const status: "confirmed" | "cancelled" = resolved.status === "confirmed" ? "confirmed" : "cancelled";
+
+  return {
+    kind: prepared.kind,
+    assistantRequestId: prepared.assistantRequestId,
+    taskId: prepared.taskId,
+    confirmationId: prepared.confirmationId,
+    status,
+    orderId: resolved.result?.orderId,
+    appointmentId: resolved.result?.appointmentId,
+  };
+}
+
+export async function prepareGroceryOrder(input: {
+  userId: string;
+  itemName: string;
+  quantity?: number;
+  unit?: string;
+  deliveryAddress?: string;
+}): Promise<PreparedAssistantOrder> {
+  const assistantRequestId = makeAssistantRequestId("grocery");
+  const quantity = Math.max(1, input.quantity ?? 1);
+  const taskCreatedAt = Date.now();
+  const taskId = await queueUiDemoTask(
+    "order.request",
+    {
+      itemName: input.itemName,
+      quantity,
+      unit: input.unit ?? "unit",
+      deliveryAddress: input.deliveryAddress || null,
+      userId: input.userId,
+    },
+    assistantRequestId,
+  );
+
+  const pending = await ensurePendingConfirmation(
+    "grocery",
+    async () =>
+      requestJson<UiRequestResponse>("/api/grocery/request", {
+        method: "POST",
+        body: JSON.stringify({
+          itemName: input.itemName,
+        }),
+      }),
+    taskCreatedAt,
+  );
+
+  const unitPrice = Number(pending.price ?? pending.result?.price ?? 149);
+  const itemName = String(pending.itemName || input.itemName || "grocery item");
+
+  return {
+    kind: "grocery",
+    assistantRequestId,
+    taskId,
+    confirmationId: pending.id,
+    quantity,
+    itemName,
+    unitPrice,
+    totalPrice: unitPrice * quantity,
+    message: pending.message || `Confirm order for ${itemName}`,
+  };
+}
+
+export async function preparePharmacyOrder(input: {
+  userId: string;
+  medicineName: string;
+  quantity?: number;
+  unit?: string;
+}): Promise<PreparedAssistantOrder> {
+  const assistantRequestId = makeAssistantRequestId("pharmacy");
+  const quantity = Math.max(1, input.quantity ?? 1);
+  const taskCreatedAt = Date.now();
+  const taskId = await queueUiDemoTask(
+    "medicine.request",
+    {
+      medicineName: input.medicineName,
+      quantity,
+      unit: input.unit ?? "strip",
+      userId: input.userId,
+    },
+    assistantRequestId,
+  );
+
+  const pending = await ensurePendingConfirmation(
+    "pharmacy",
+    async () =>
+      requestJson<UiRequestResponse>("/api/pharmacy/request", {
+        method: "POST",
+        body: JSON.stringify({
+          medicineName: input.medicineName,
+        }),
+      }),
+    taskCreatedAt,
+  );
+
+  const unitPrice = Number(pending.price ?? pending.result?.price ?? 160);
+  const itemName = String(pending.medicineName || input.medicineName || "medicine");
+
+  return {
+    kind: "pharmacy",
+    assistantRequestId,
+    taskId,
+    confirmationId: pending.id,
+    quantity,
+    itemName,
+    unitPrice,
+    totalPrice: unitPrice * quantity,
+    message: pending.message || `Confirm order for ${itemName}`,
+  };
+}
+
+export async function prepareDoctorAppointment(input: {
+  userId: string;
+  doctorName: string;
+  specialization: string;
+  appointmentTime: string;
+  mode: "online" | "home";
+}): Promise<PreparedAssistantOrder> {
+  const assistantRequestId = makeAssistantRequestId("doctor");
+  const taskCreatedAt = Date.now();
+  const doctorType = String(input.specialization || "general physician").trim().toLowerCase();
+  const visitType: "online" | "home" = input.mode === "home" ? "home" : "online";
+
+  const taskId = await queueUiDemoTask(
+    "doctor.request",
+    {
+      doctorType,
+      visitType,
+      userId: input.userId,
+    },
+    assistantRequestId,
+  );
+
+  const pending = await ensurePendingConfirmation(
+    "doctor",
+    async () =>
+      requestJson<UiRequestResponse>("/api/doctor/request", {
+        method: "POST",
+        body: JSON.stringify({
+          doctorType,
+          visitType,
+        }),
+      }),
+    taskCreatedAt,
+  );
+
+  const unitPrice = Number(pending.fee ?? pending.result?.fee ?? 700);
+  const itemName = String(pending.doctorName || input.doctorName || "Available Doctor");
+
+  return {
+    kind: "doctor",
+    assistantRequestId,
+    taskId,
+    confirmationId: pending.id,
+    quantity: 1,
+    itemName,
+    unitPrice,
+    totalPrice: unitPrice,
+    message: pending.message || `Confirm appointment with ${itemName}`,
+    doctorMode: visitType,
+  };
 }
 
 export async function getSahaaraHealth(): Promise<HealthData> {
@@ -174,18 +501,20 @@ export async function placeGroceryOrder(input: {
   quantity?: number;
   unit?: string;
   deliveryAddress?: string;
-}): Promise<{ orderId: string }> {
-  const payload = await request<GroceryOrderData>("/api/grocery/order", {
-    method: "POST",
-    body: JSON.stringify({
-      userId: input.userId,
-      items: [{ name: input.itemName, quantity: input.quantity ?? 1, unit: input.unit ?? "1 unit" }],
-      deliveryAddress: input.deliveryAddress || null,
-      notes: "Placed from ai web app",
-    }),
-  });
+}): Promise<{ orderId: string; assistantRequestId: string; taskId: string | null; confirmationId: string }> {
+  const prepared = await prepareGroceryOrder(input);
+  const confirmed = await confirmPreparedOrder(prepared, true);
+  const orderId = String(confirmed.orderId || "").trim();
+  if (!orderId) {
+    throw new Error("Grocery confirmation resolved but order id is missing");
+  }
 
-  return { orderId: payload.data.orderId };
+  return {
+    orderId,
+    assistantRequestId: prepared.assistantRequestId,
+    taskId: prepared.taskId,
+    confirmationId: prepared.confirmationId,
+  };
 }
 
 export async function placePharmacyOrder(input: {
@@ -193,18 +522,20 @@ export async function placePharmacyOrder(input: {
   medicineName: string;
   quantity?: number;
   unit?: string;
-}): Promise<{ orderId: string }> {
-  const payload = await request<PharmacyOrderData>("/api/pharmacy/order", {
-    method: "POST",
-    body: JSON.stringify({
-      userId: input.userId,
-      medicines: [{ name: input.medicineName, quantity: input.quantity ?? 1, unit: input.unit ?? "1 strip" }],
-      prescriptionRequired: false,
-      notes: "Placed from ai web app",
-    }),
-  });
+}): Promise<{ orderId: string; assistantRequestId: string; taskId: string | null; confirmationId: string }> {
+  const prepared = await preparePharmacyOrder(input);
+  const confirmed = await confirmPreparedOrder(prepared, true);
+  const orderId = String(confirmed.orderId || "").trim();
+  if (!orderId) {
+    throw new Error("Pharmacy confirmation resolved but order id is missing");
+  }
 
-  return { orderId: payload.data.orderId };
+  return {
+    orderId,
+    assistantRequestId: prepared.assistantRequestId,
+    taskId: prepared.taskId,
+    confirmationId: prepared.confirmationId,
+  };
 }
 
 export async function placeDoctorAppointment(input: {
@@ -213,18 +544,18 @@ export async function placeDoctorAppointment(input: {
   specialization: string;
   appointmentTime: string;
   mode: "online" | "home";
-}): Promise<{ appointmentId: string }> {
-  const payload = await request<AppointmentOrderData>("/api/appointment/book", {
-    method: "POST",
-    body: JSON.stringify({
-      userId: input.userId,
-      doctorName: input.doctorName,
-      specialization: input.specialization,
-      appointmentTime: input.appointmentTime,
-      mode: input.mode,
-      notes: "Booked from ai web app",
-    }),
-  });
+}): Promise<{ appointmentId: string; assistantRequestId: string; taskId: string | null; confirmationId: string }> {
+  const prepared = await prepareDoctorAppointment(input);
+  const confirmed = await confirmPreparedOrder(prepared, true);
+  const appointmentId = String(confirmed.appointmentId || "").trim();
+  if (!appointmentId) {
+    throw new Error("Doctor confirmation resolved but appointment id is missing");
+  }
 
-  return { appointmentId: payload.data.appointmentId };
+  return {
+    appointmentId,
+    assistantRequestId: prepared.assistantRequestId,
+    taskId: prepared.taskId,
+    confirmationId: prepared.confirmationId,
+  };
 }

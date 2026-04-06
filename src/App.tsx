@@ -5,12 +5,14 @@ import { Avatar } from "./components/Avatar";
 import type { AvatarControls } from "./components/Avatar";
 import { isSarvamConfigured, llmReplyMock, llmReplySarvam, sttSarvam, ttsSarvam } from "./services/sarvamClient";
 import {
+  confirmPreparedOrder,
   getSahaaraHealth,
   getWatchLatest,
   getWatchUserId,
-  placeDoctorAppointment,
-  placeGroceryOrder,
-  placePharmacyOrder,
+  prepareDoctorAppointment,
+  prepareGroceryOrder,
+  preparePharmacyOrder,
+  type PreparedAssistantOrder,
 } from "./services/sahaaraApiClient";
 
 type ChatRole = "user" | "assistant";
@@ -29,6 +31,11 @@ interface WatchPanelSnapshot {
   spo2?: number;
   skinTemp?: number;
   freefallStatus?: string;
+}
+
+interface ActionReply {
+  reply: string;
+  pendingOrder?: PreparedAssistantOrder;
 }
 
 const STORAGE_KEY = "sahaara.ai.chatHistory.v2";
@@ -61,6 +68,7 @@ function App() {
   const [healthLoading, setHealthLoading] = useState(false);
   const [healthError, setHealthError] = useState("");
   const [watchSnapshot, setWatchSnapshot] = useState<WatchPanelSnapshot | null>(null);
+  const [pendingOrder, setPendingOrder] = useState<PreparedAssistantOrder | null>(null);
 
   const supportsRecording =
     typeof window !== "undefined" &&
@@ -199,9 +207,28 @@ function App() {
       let reply = "";
 
       try {
-        const actionReply = await tryHandleSahaaraAction(normalized);
-        if (actionReply) {
-          reply = actionReply;
+        if (pendingOrder && isConfirmReply(normalized)) {
+          const confirmed = await confirmPreparedOrder(pendingOrder, true);
+          setPendingOrder(null);
+          if (confirmed.kind === "doctor") {
+            reply = `Confirmed. Appointment booked with id ${confirmed.appointmentId || "N/A"}. Request id: ${confirmed.assistantRequestId}. Confirmation id: ${confirmed.confirmationId}.${confirmed.taskId ? ` Task id: ${confirmed.taskId}.` : ""}`;
+          } else {
+            reply = `Confirmed. Order placed with id ${confirmed.orderId || "N/A"}. Request id: ${confirmed.assistantRequestId}. Confirmation id: ${confirmed.confirmationId}.${confirmed.taskId ? ` Task id: ${confirmed.taskId}.` : ""}`;
+          }
+        } else if (pendingOrder && isCancelReply(normalized)) {
+          const cancelled = await confirmPreparedOrder(pendingOrder, false);
+          setPendingOrder(null);
+          reply = `Cancelled. No order was placed. Request id: ${cancelled.assistantRequestId}. Confirmation id: ${cancelled.confirmationId}.`;
+        } else if (pendingOrder && isOrderIntentMessage(normalized)) {
+          reply = `Pending confirmation: ${pendingOrder.itemName}, qty ${pendingOrder.quantity}, price Rs ${pendingOrder.unitPrice} each (total Rs ${pendingOrder.totalPrice}). Reply "confirm" to place or "cancel" to stop.`;
+        } else {
+          const actionReply = await tryHandleSahaaraAction(normalized);
+          if (actionReply) {
+            reply = actionReply.reply;
+            if (actionReply.pendingOrder) {
+              setPendingOrder(actionReply.pendingOrder);
+            }
+          }
         }
       } catch (error) {
         setStatus(`API action failed: ${toErrorMessage(error)}`);
@@ -236,7 +263,7 @@ function App() {
         await speakReply(reply);
       }
     },
-    [appendMessage, isChatOnly, speakReply]
+    [appendMessage, isChatOnly, pendingOrder, speakReply]
   );
 
   const processVoiceBlob = useCallback(
@@ -656,15 +683,28 @@ function App() {
   );
 }
 
-async function tryHandleSahaaraAction(text: string): Promise<string | null> {
+async function tryHandleSahaaraAction(text: string): Promise<ActionReply | null> {
   const lower = text.toLowerCase();
   const userId = getWatchUserId();
+  const hasOrderVerb = /\b(order|book|place|get|buy|need|want|arrange|send)\b/i.test(lower);
+  const groceryHint =
+    /\b(grocery|groceries|ration|atta|rice|milk|bread|egg|eggs|banana|apple|dal|sugar|salt|flour)\b/i.test(lower);
+  const medicineHint =
+    /\b(pharmacy|medicine|medicines|tablet|tablets|meds|drug|paracetamol|dolo|crocin|calpol|cetirizine|azithromycin|vitamin c)\b/i.test(
+      lower
+    );
+  const doctorHint =
+    /\b(doctor|appointment|consult|physician|cardio|cardiologist|derma|dermatology|pediatric|neurology|pulmonology)\b/i.test(
+      lower
+    );
 
   if (/(api health|health status|backend status|server status)/i.test(lower)) {
     const health = await getSahaaraHealth();
-    return health.firebase.initialized
-      ? "Sahaara API is connected and Firebase is initialized."
-      : "Sahaara API is reachable but Firebase is not initialized yet.";
+    return {
+      reply: health.firebase.initialized
+        ? "Sahaara API is connected and Firebase is initialized."
+        : "Sahaara API is reachable but Firebase is not initialized yet.",
+    };
   }
 
   if (/(watch|heart rate|spo2|oxygen|skin temp|temperature|vitals)/i.test(lower)) {
@@ -672,51 +712,72 @@ async function tryHandleSahaaraAction(text: string): Promise<string | null> {
     const hr = watch.snapshot.heartRate != null ? `HR ${watch.snapshot.heartRate}` : "HR --";
     const spo2 = watch.snapshot.spo2 != null ? `SpO2 ${watch.snapshot.spo2}` : "SpO2 --";
     const temp = watch.snapshot.skinTemp != null ? `Temp ${watch.snapshot.skinTemp}` : "Temp --";
-    return `Latest watch vitals for ${watch.userId}: ${hr}, ${spo2}, ${temp}.`;
+    return { reply: `Latest watch vitals for ${watch.userId}: ${hr}, ${spo2}, ${temp}.` };
   }
 
-  if (/(grocery|groceries|buy|order).*\b(order|book|place|need|want)\b|\b(order|book|place|need|want)\b.*(grocery|groceries|buy)/i.test(lower)) {
+  if (hasOrderVerb && groceryHint) {
     const item = pickItem(text, ["rice", "milk", "bread", "egg", "eggs", "banana", "apple", "atta", "dal", "sugar", "salt"]) || "milk";
     const quantity = pickQuantity(lower) ?? 1;
-    const order = await placeGroceryOrder({
+    const order = await prepareGroceryOrder({
       userId,
       itemName: item,
       quantity,
       unit: "unit",
       deliveryAddress: DEFAULT_ADDRESS,
     });
-    return `Grocery order placed for ${quantity} ${item}. Order id: ${order.orderId}.`;
+    return {
+      reply: `Please confirm grocery order: ${order.itemName}, qty ${order.quantity}, price Rs ${order.unitPrice} each (total Rs ${order.totalPrice}). Reply "confirm" to place or "cancel" to stop.`,
+      pendingOrder: order,
+    };
   }
 
-  if (/(pharmacy|medicine|medicines|tablet|meds|drug)/i.test(lower) && /(order|book|place|need|want|buy)/i.test(lower)) {
+  if (hasOrderVerb && medicineHint) {
     const medicine =
       pickItem(text, ["paracetamol", "dolo", "crocin", "calpol", "azithromycin", "vitamin c", "cetirizine"]) ||
       "paracetamol";
     const quantity = pickQuantity(lower) ?? 1;
-    const order = await placePharmacyOrder({
+    const order = await preparePharmacyOrder({
       userId,
       medicineName: medicine,
       quantity,
       unit: "strip",
     });
-    return `Pharmacy order placed for ${quantity} ${medicine}. Order id: ${order.orderId}.`;
+    return {
+      reply: `Please confirm pharmacy order: ${order.itemName}, qty ${order.quantity}, price Rs ${order.unitPrice} each (total Rs ${order.totalPrice}). Reply "confirm" to place or "cancel" to stop.`,
+      pendingOrder: order,
+    };
   }
 
-  if (/(doctor|appointment|consult|book doctor|book appointment)/i.test(lower)) {
+  if (doctorHint && (hasOrderVerb || /\b(consult|appointment)\b/i.test(lower))) {
     const mode = /(home|at home)/i.test(lower) ? "home" : "online";
     const specialization = pickSpecialization(lower);
     const appointmentTime = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
-    const appointment = await placeDoctorAppointment({
+    const appointment = await prepareDoctorAppointment({
       userId,
       doctorName: "Available Doctor",
       specialization,
       appointmentTime,
       mode,
     });
-    return `Doctor appointment booked (${specialization}, ${mode}). Appointment id: ${appointment.appointmentId}.`;
+    return {
+      reply: `Please confirm doctor booking: ${appointment.itemName}, mode ${appointment.doctorMode || mode}, fee Rs ${appointment.unitPrice}. Reply "confirm" to book or "cancel" to stop.`,
+      pendingOrder: appointment,
+    };
   }
 
   return null;
+}
+
+function isConfirmReply(text: string): boolean {
+  return /\b(confirm|yes|proceed|place|book it|do it|ok|okay|go ahead)\b/i.test(text);
+}
+
+function isCancelReply(text: string): boolean {
+  return /\b(cancel|no|stop|don\s*'?t|do not)\b/i.test(text);
+}
+
+function isOrderIntentMessage(text: string): boolean {
+  return /\b(order|book|buy|get|medicine|grocery|doctor|appointment|atta|pharmacy)\b/i.test(text);
 }
 
 function pickQuantity(text: string): number | null {
